@@ -30,5 +30,11 @@ constexpr bool TOUCH_MIRROR_Y = false;
 #ifndef WALLPAD_EW11_PORT
 #define WALLPAD_EW11_PORT 8899
 #endif
+#ifndef WIFI_SSID
+#define WIFI_SSID ""      // empty: use the Ethernet port instead of WiFi
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD ""
+#endif
 constexpr const char* WALLPAD_HOST = WALLPAD_EW11_HOST;
 constexpr uint16_t WALLPAD_PORT = WALLPAD_EW11_PORT;

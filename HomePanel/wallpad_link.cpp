@@ -1,6 +1,7 @@
 #include "wallpad_link.h"
 #include <Arduino.h>
 #include <ETH.h>
+#include <WiFi.h>
 #include <NetworkClient.h>
 
 // Samsung SDS wallpad packets (as observed on this home's bus, 9600 8E1):
@@ -18,17 +19,24 @@ portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
 WallpadSnapshot shared = {};
 const char* targetHost = nullptr;
 uint16_t targetPort = 0;
+bool useWifi = false;
 
 uint8_t buf[64];
 int len = 0;
 uint32_t packets = 0, badBytes = 0;
 
 void setState(WallpadLinkState s, uint32_t ip) {
+  const int8_t rssi = (useWifi && s >= WALLPAD_NO_IP) ? int8_t(WiFi.RSSI()) : 0;
   portENTER_CRITICAL(&lock);
   shared.state = s;
   shared.ip = ip;
+  shared.wifi = useWifi;
+  shared.rssi = rssi;
   portEXIT_CRITICAL(&lock);
 }
+
+bool linkUp() { return useWifi ? WiFi.status() == WL_CONNECTED : ETH.linkUp(); }
+IPAddress localIp() { return useWifi ? WiFi.localIP() : ETH.localIP(); }
 
 bool checksumOk(const uint8_t* p, int n) {
   uint8_t x = 0;
@@ -96,8 +104,8 @@ void linkTask(void*) {
   NetworkClient client;
   uint32_t lastByte = 0;
   for(;;) {
-    if(!ETH.linkUp()) { client.stop(); setState(WALLPAD_NO_CABLE, 0); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
-    const IPAddress ip = ETH.localIP();
+    if(!linkUp()) { client.stop(); setState(useWifi ? WALLPAD_NO_WIFI : WALLPAD_NO_CABLE, 0); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+    const IPAddress ip = localIp();
     if(ip == IPAddress(0,0,0,0)) { client.stop(); setState(WALLPAD_NO_IP, 0); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
     if(!client.connected()) {
       setState(WALLPAD_CONNECTING, uint32_t(ip));
@@ -121,15 +129,24 @@ void linkTask(void*) {
 }
 }
 
-void wallpadBegin(const char* host, uint16_t port) {
+void wallpadBegin(const char* host, uint16_t port, const char* wifiSsid, const char* wifiPassword) {
   targetHost = host;
   targetPort = port;
+  useWifi = wifiSsid && *wifiSsid;
   if(!host || !*host) { setState(WALLPAD_NOT_CONFIGURED, 0); return; }
-  if(!ETH.begin(ETH_PHY_IP101, PHY_ADDR, PHY_MDC, PHY_MDIO, PHY_RESET, EMAC_CLK_EXT_IN)) {
-    setState(WALLPAD_NO_ETHERNET, 0);
-    return;
+  if(useWifi) {
+    // WiFi runs on the ESP32-C6 coprocessor (ESP-Hosted); the driver reconnects on its own.
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(wifiSsid, wifiPassword);
+    setState(WALLPAD_NO_WIFI, 0);
+  } else {
+    if(!ETH.begin(ETH_PHY_IP101, PHY_ADDR, PHY_MDC, PHY_MDIO, PHY_RESET, EMAC_CLK_EXT_IN)) {
+      setState(WALLPAD_NO_ETHERNET, 0);
+      return;
+    }
+    setState(WALLPAD_NO_CABLE, 0);
   }
-  setState(WALLPAD_NO_CABLE, 0);
   xTaskCreate(linkTask, "wallpad", 6144, nullptr, 4, nullptr);
 }
 

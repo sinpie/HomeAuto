@@ -2,7 +2,8 @@
 #include <stdint.h>
 
 // Read-only link to the wallpad RS485 bus through an EW11 (RS485 -> TCP server),
-// over the board's Ethernet port. This module never transmits to the bus.
+// over WiFi (ESP32-C6 coprocessor) when an SSID is configured, otherwise over the
+// board's Ethernet port. This module never transmits to the bus.
 
 constexpr int HEAT_ZONES = 8;  // the wallpad polls heating groups 1..8
 
@@ -18,6 +19,7 @@ enum WallpadLinkState : uint8_t {
   WALLPAD_NOT_CONFIGURED,  // no EW11 address set (local_config.h)
   WALLPAD_NO_ETHERNET,  // Ethernet driver failed to start
   WALLPAD_NO_CABLE,     // no Ethernet link
+  WALLPAD_NO_WIFI,      // WiFi not (yet) associated
   WALLPAD_NO_IP,        // waiting for DHCP
   WALLPAD_CONNECTING,   // connecting to the EW11
   WALLPAD_CONNECTED,    // TCP connected (data may still be absent)
@@ -25,6 +27,8 @@ enum WallpadLinkState : uint8_t {
 
 struct WallpadSnapshot {
   WallpadLinkState state;
+  bool wifi;            // true: WiFi, false: Ethernet
+  int8_t rssi;          // WiFi signal (dBm), 0 when unknown
   uint32_t ip;          // our IPv4 address (network byte order as IPAddress uses)
   uint32_t packets;     // checksum-valid packets
   uint32_t badBytes;    // bytes that did not form a valid packet
@@ -32,5 +36,6 @@ struct WallpadSnapshot {
   HeatZone zones[HEAT_ZONES];
 };
 
-void wallpadBegin(const char* host, uint16_t port);
+// wifiSsid empty -> Ethernet. The password is only passed to the WiFi driver.
+void wallpadBegin(const char* host, uint16_t port, const char* wifiSsid, const char* wifiPassword);
 WallpadSnapshot wallpadSnapshot();

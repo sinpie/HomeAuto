@@ -305,6 +305,7 @@ const char* wallpadStatusText() {
     case WALLPAD_NOT_CONFIGURED: return "EW11 주소 설정 필요";
     case WALLPAD_NO_ETHERNET: return "이더넷 장치 오류";
     case WALLPAD_NO_CABLE: return "LAN 케이블 연결 필요";
+    case WALLPAD_NO_WIFI: return "WiFi 연결 중";
     case WALLPAD_NO_IP: return "네트워크 주소 받는 중";
     case WALLPAD_CONNECTING: return "월패드 연결 중";
     default: return wallpadLive() ? "월패드 연결됨" : "월패드 신호 없음";
@@ -440,8 +441,10 @@ void drawSettings() {
   char link[96];
   if(wallpad.state==WALLPAD_CONNECTED) {
     const IPAddress ip(wallpad.ip);
-    snprintf(link, sizeof(link), "%s · %s → EW11 · 패킷 %lu", wallpadLive() ? "수신 중" : "신호 없음",
-             ip.toString().c_str(), (unsigned long)wallpad.packets);
+    char medium[24];
+    if(wallpad.wifi) snprintf(medium, sizeof(medium), "WiFi %ddBm", wallpad.rssi); else snprintf(medium, sizeof(medium), "유선");
+    snprintf(link, sizeof(link), "%s · %s %s · 패킷 %lu", wallpadLive() ? "수신 중" : "신호 없음",
+             medium, ip.toString().c_str(), (unsigned long)wallpad.packets);
   } else snprintf(link, sizeof(link), "%s", wallpadStatusText());
   rightText(968, 362, link, wallpadLive() ? ACCENT : MUTED, FONT_CAPTION);
   divider(256, 404, 712);
@@ -577,7 +580,7 @@ void setup() {
   if(background) memcpy(background, BG_IMAGE, SCREEN_W*SCREEN_H*2);
   frame = panelBackBuffer();
   touchOk = touchBegin();
-  wallpadBegin(WALLPAD_HOST, WALLPAD_PORT);
+  wallpadBegin(WALLPAD_HOST, WALLPAD_PORT, WIFI_SSID, WIFI_PASSWORD);
   render();
   panelBrightness(brightness);
   Serial.println("HELLO|HomePanel|4");
