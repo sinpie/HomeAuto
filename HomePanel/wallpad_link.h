@@ -39,3 +39,9 @@ struct WallpadSnapshot {
 // wifiSsid empty -> Ethernet. The password is only passed to the WiFi driver.
 void wallpadBegin(const char* host, uint16_t port, const char* wifiSsid, const char* wifiPassword);
 WallpadSnapshot wallpadSnapshot();
+
+// Debug (serial "NET", "NET SCAN"): link details and the last WiFi disconnect reason.
+// With scan, also reports how many networks are visible and whether the configured
+// SSID is among them (other names are never printed). The scan blocks for seconds.
+class Print;
+void wallpadDiagnose(Print& out, const char* wifiSsid, bool scan);

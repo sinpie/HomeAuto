@@ -10,6 +10,11 @@
 - 실물 업로드·부팅·화면·터치를 확인했습니다.
 - 화면 크기는 제조사 예제의 **1024×600** 기준입니다. 상품 설명에 적힌 1027×768과 다릅니다.
 - **보일러 상태는 월패드 RS485 버스에서 직접 읽습니다**(EW11 경유, 읽기 전용). 아래 "월패드 RS485 연동" 참고.
+  WiFi로 연결해 방 4개의 켜짐·설정·현재 온도가 실시간 표시되는 것을 실물에서 확인했습니다.
+- **WiFi:** 부팅 직후 첫 `WiFi.begin()`은 C6 보조 칩 연결(ESP-Hosted)이 준비되기 전이라 무시되는 경우가 있어,
+  연결될 때까지 다시 시도합니다(첫 재시도 약 6초 후, 이후 20초 간격).
+- **빌드 시간:** 파일 하나를 고친 증분 빌드 약 1.7분, 화면 자원이 그대로면 업로드 약 17초(이 PC 기준).
+  전체 재빌드는 약 13분입니다. 아래 "빌드 시간 줄이기" 참고.
 - Python 검사 16개(`tools/test_bridge.py`, `tools/test_identify.py`, `tools/test_rs485.py`)가 통과했습니다.
 
 ## 월패드 RS485 연동 (삼성SDS EZON 계열)
@@ -68,7 +73,8 @@ py -3 tools\rs485_log.py --analyze tools\rs485-logs\capture-xxx.log
 Espressif FAQ는 이 리비전의 유사한 업로드 문제에 esptool 5.3.dev3 또는 4.12.dev2를 안내합니다.
 
 수정된 `build.ps1`은 v3.00 이상 칩용으로 재빌드하고, `tools/upload_p4.py`를 통해
-프로젝트의 `.tools/esptool-p4` 가상환경에 esptool **5.3.dev3**를 설치해 **115200bps**로 업로드합니다.
+프로젝트의 `.tools/esptool-p4` 가상환경에 esptool **5.3.dev3**를 설치해 **921600bps**로 업로드합니다
+(`--before usb-reset`: 앱이 재시작을 반복해 포트가 끊겨도 업로드됨).
 첫 실행에는 인터넷이 필요합니다. 기존 Arduino 설치 및 포함된 esptool은 수정하지 않습니다.
 v3 이전 설정으로 빌드된 파일은 업로드 전에 거부하도록 검사합니다.
 
@@ -122,13 +128,27 @@ Windows 탐색기에서 `Build-Check.cmd`를 직접 실행하면 해당 PC의 �
 - 디자인: 서울 야경 사진 배경 위 반투명(글래스) 카드, 에메랄드 강조색 한 가지, 선 아이콘 18종,
   Noto Sans KR 안티앨리어싱 글꼴 4단계(19/23/30/60px), 터치 영역 최소 56px, 누를 때 강조색 테두리로 반응을 표시합니다.
 
-### 화면 자원 다시 만들기
+### 화면 자원 (배경·아이콘·글꼴)
 
-- 글꼴: `py -3 tools\make_font.py` (UI 문구를 바꾼 뒤 실행. Noto Sans KR, OFL-1.1)
-- 배경·아이콘: `py -3 tools\make_assets.py --photo tools\photos\unsplash-mtFSMhcqNpM.jpg`
-  배경 사진은 Unsplash `mtFSMhcqNpM`(https://unsplash.com/photos/mtFSMhcqNpM, Unsplash License)입니다.
+화면 자원은 펌웨어에 컴파일하지 않습니다. 하나의 바이너리 `assets/assets.bin`(약 1.4MB)으로 묶어
+플래시의 기존 `ffat` 데이터 파티션(0x610000, 9.9MB)에 따로 씁니다. 펌웨어는 부팅할 때 이 영역을
+메모리에 매핑(mmap)해 복사 없이 씁니다(`HomePanel/assets.cpp`). 형식은 `tools/assets_pack.py` 맨 위 설명에 있습니다.
+
+- 글꼴: `py -3 tools\make_font.py` — UI 문구를 바꾼 뒤 실행(Noto Sans KR, OFL-1.1). `assets.bin`을 다시 묶습니다.
+- 배경·아이콘: `py -3 tools\make_assets.py --photo <사진.jpg>` — 처리된 배경을 `assets/background.png`로 저장하고 다시 묶습니다.
+  현재 배경은 Unsplash `mtFSMhcqNpM`(https://unsplash.com/photos/mtFSMhcqNpM, Unsplash License)입니다.
   `--photo` 없이 실행하면 코드로 그린 야경 일러스트를 씁니다. 아이콘은 이 스크립트가 직접 그립니다.
-- 화면 캡처(디버그): `py -3 tools\screenshot.py out.png [--tap X Y]`. USB로 `SHOT`, `TAP|x|y`를 보내 실제 화면을 받습니다.
+- 업로드: `tools\upload_p4.py`가 `assets.bin`이 바뀌었을 때만 함께 씁니다(`--assets auto|always|never`).
+  플래시를 지웠거나 보드를 바꿨으면 `--assets always`로 한 번 올립니다.
+- 자원이 없으면 화면이 비고 시리얼에 `ERROR|assets|...`가 나옵니다. `ASSETS` 명령으로 상태를 확인할 수 있습니다.
+
+### 디버그 명령 (USB 시리얼, 115200)
+
+- `SHOT` / `TAP|x|y`: 화면 캡처와 터치 흉내. `py -3 tools\screenshot.py out.png [--tap X Y]`
+- `NET`: 연결 방식, 상태, 받은 패킷 수, WiFi 상태와 **마지막 끊김 이유 코드**
+  (15·204 = 비밀번호 오류 가능성 높음, 201 = AP 없음, 202 = 인증 실패).
+- `NET SCAN`: 위 내용 + 주변 WiFi 개수와 설정한 SSID의 신호·채널(다른 SSID 이름은 출력하지 않음). 몇 초간 멈춥니다.
+- `ASSETS`: 화면 자원 로드 결과.
 
 ## Arduino IDE에서 업로드
 
@@ -137,8 +157,9 @@ Windows 탐색기에서 `Build-Check.cmd`를 직접 실행하면 해당 PC의 �
 3. 보드: **ESP32P4 Dev Module**, Chip Variant: **v3.00 or newer**, PSRAM: **Enabled**, Flash: **16MB**,
    Partition: **16M Flash (3MB APP/9.9MB FATFS)**,
    USB Mode: **Hardware CDC and JTAG**, USB CDC On Boot: **Enabled**.
-4. `panel_variant.h`의 `HOME_PANEL_NEW`를 신형이면 `1`, 구형이면 `0`으로 설정합니다.
-   소스 기본값 `0`은 구형 코드 선택값이며, 사용자의 패널이 구형으로 확인되었다는 뜻이 아닙니다.
+4. 패널 버전은 기본값이 New입니다(이 프로젝트 보드에서 확인). 구형이면 `HomePanel/panel_select.h`에
+   `#define HOME_PANEL_NEW 0`을 둡니다(`build.ps1 -Panel Old`가 자동으로 만듭니다).
+   화면 자원은 IDE로 올라가지 않으므로 `py -3 tools\upload_p4.py --panel New --assets always`로 한 번 올립니다.
 5. IDE 포함 esptool 5.1.0으로는 이 칩의 업로드가 실패했으므로, 업로드에는 아래 수정 스크립트를 사용합니다.
 6. 화면 출력·터치 좌표·밝기를 실물에서 확인합니다. 다른 패널 버전을 무작정 연속 업로드하지 말고
    판매자 표기나 패널 모델을 확인하는 것이 좋습니다.
@@ -162,6 +183,21 @@ Windows 탐색기에서 `Build-Check.cmd`를 직접 실행하면 해당 PC의 �
 `-Upload`를 생략하면 컴파일만 합니다. 스크립트는 빌드가 실패하면 업로드를 실행하지 않습니다.
 `Upload-New-Panel.cmd` / `Upload-Old-Panel.cmd`도 같은 작업을 실행합니다.
 PowerShell 정책 때문에 스크립트가 실행되지 않으면 Arduino IDE를 이용하세요.
+
+### 빌드 시간 줄이기
+
+같은 빌드 폴더(`build-New`)를 다시 쓰면 바뀐 파일만 다시 컴파일합니다. 라이브러리 탐색도 파일별로 캐시됩니다.
+(`arduino-cli --skip-libraries-discovery`는 링크할 라이브러리까지 빠뜨려 쓸 수 없습니다.)
+
+- **빌드 폴더가 통째로 지워지는 경우**(전체 재빌드, 이 PC에서 약 13분): 스케치 파일 목록이 바뀌었을 때, `--build-property`나 보드 옵션이
+  바뀌었을 때, ESP32 보드 패키지 폴더의 `.txt` 파일이 바뀌었을 때. 빌드 중간에 멈추는 것도 피하세요.
+- 패널 선택은 컴파일 옵션이 아니라 `panel_select.h` 파일로 합니다. 컴파일 옵션을 쓰면 ESP32 코어(57개 파일)를 매번 다시 빌드합니다.
+- 큰 데이터(배경·글꼴)는 컴파일하지 않고 `assets.bin`으로 따로 올립니다.
+- **Windows Defender 제외 설정**(직접 설정해야 함, 보안 설정이므로 신중히): 컴파일러가 파일을 열 때마다 검사되어
+  매우 느려집니다. 보고된 사례에서 3~6배 빨라졌습니다.
+  - 폴더: `%LOCALAPPDATA%\Arduino15\packages\esp32`, `%LOCALAPPDATA%\arduino`, 프로젝트의 `build-New`·`build-Old`
+  - 프로세스: `cc1plus.exe`, `cc1.exe`, `riscv32-esp-elf-g++.exe`, `riscv32-esp-elf-gcc.exe`, `as.exe`, `ld.exe`,
+    `collect2.exe`, `arduino-cli.exe`, `esptool.exe`, `gen_esp32part.exe`
 
 ## 선택 사항: Home Assistant USB 브리지
 

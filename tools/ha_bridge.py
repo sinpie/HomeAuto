@@ -4,21 +4,19 @@ Set HOME_ASSISTANT_TOKEN in the environment, fill entities in your private
 bridge.json, then: python tools/ha_bridge.py --config bridge.json
 
 Panel features and the entities they may use (anything else is rejected):
-  boiler       climate.*                      on / off / target temperature
   office_call  script.* or button.*           management office call
   elevator     floor: sensor.*, call: script.* or button.*, home_floor: int
   doors        3 x binary_sensor.* / event.*  one-way calls: 현관, 1층 현관, 지하주차장 문
 
 Serial protocol (one line each, ASCII):
-  panel -> PC   CMD|E|call   CMD|O|call   CMD|B|on   CMD|B|off   CMD|B|set|<temp x10>
+  panel -> PC   CMD|E|call   CMD|O|call
   PC -> panel   PING
                 ELEV|<floor>|<dir -1/0/1>|<calling 0/1>   (floor 0 = unknown, B1 = -1)
                 ELEVERR
-                BOIL|<power -1/0/1>|<current x10>|<target x10>   (-9999 = unknown)
-                BOILOK  BOILERR
                 OFFICE|<calling 0/1>   OFFICEERR
                 RING|<door 0..2>
 Command success is only reported after the server accepted the service call.
+The boiler is not handled here: the panel reads it directly from the wallpad bus.
 """
 import argparse
 import json
@@ -39,13 +37,6 @@ ELEVATOR_CALL_TIMEOUT = 180
 def parse_command(line):
     if line in ('CMD|E|call', 'CMD|O|call'):
         return (line[4], 'call')
-    if line in ('CMD|B|on', 'CMD|B|off'):
-        return ('B', line[6:])
-    match = re.fullmatch(r'CMD\|B\|set\|(\d{3})', line)
-    if match:
-        value = int(match[1])
-        if 100 <= value <= 400 and value % 5 == 0:
-            return ('B', 'set', value)
     return None
 
 
@@ -64,7 +55,6 @@ def validate_config(config):
         raise ValueError('base_url must be an HTTP(S) server URL without credentials')
     if url.query or url.fragment or url.path.rstrip('/'):
         raise ValueError('base_url must be the server root URL')
-    _entity(config.get('boiler'), 'climate', 'boiler')
     _entity(config.get('office_call'), CALL_DOMAINS, 'office_call')
     elevator = config.get('elevator')
     if elevator is not None:
@@ -103,15 +93,6 @@ def to_x10(value):
     return round(number * 10) if -40 <= number <= 90 else UNKNOWN
 
 
-def boiler_values(data):
-    state = data.get('state')
-    if state in (None, 'unavailable', 'unknown'):
-        return -1, UNKNOWN, UNKNOWN
-    attributes = data.get('attributes', {})
-    power = 0 if state == 'off' else 1
-    return power, to_x10(attributes.get('current_temperature')), to_x10(attributes.get('temperature'))
-
-
 def door_rang(entity, previous, current):
     """True when a door entity reports a new call."""
     if previous is None or current in (None, 'unavailable', 'unknown'):
@@ -131,7 +112,6 @@ class Gateway:
     def __init__(self, config, token, clock=time.monotonic):
         validate_config(config)
         self.base = config['base_url'].rstrip('/')
-        self.boiler = config.get('boiler')
         self.office = config.get('office_call')
         self.elevator = config.get('elevator')
         self.doors = config.get('doors', [None, None, None])
@@ -188,10 +168,6 @@ class Gateway:
             calling = False
         self.emit(f'ELEV|{floor}|{direction if floor else 0}|{int(calling)}')
 
-    def report_boiler(self):
-        power, current, target = boiler_values(self.state(self.boiler)) if self.boiler else (-1, UNKNOWN, UNKNOWN)
-        self.emit(f'BOIL|{power}|{current}|{target}')
-
     def report_office(self):
         self.emit(f'OFFICE|{int(self.clock() < self.office_until)}')
 
@@ -221,17 +197,8 @@ class Gateway:
                 self.call(self.office)
                 self.office_until = self.clock() + OFFICE_CALL_SECONDS
                 self.report_office()
-            elif kind == 'B':
-                if not self.boiler:
-                    raise LookupError('boiler not configured')
-                if command[1] == 'set':
-                    self.call(self.boiler, 'set_temperature', {'temperature': command[2] / 10})
-                else:
-                    self.call(self.boiler, 'turn_on' if command[1] == 'on' else 'turn_off')
-                self.emit('BOILOK')
-                self.report_boiler()
         except Exception:
-            self.emit({'E': 'ELEVERR', 'O': 'OFFICEERR', 'B': 'BOILERR'}[kind])
+            self.emit({'E': 'ELEVERR', 'O': 'OFFICEERR'}[kind])
 
     def worker(self):
         poll_at = 0
@@ -243,7 +210,6 @@ class Gateway:
             if self.clock() >= poll_at:
                 self.check_doors()
                 self.report_elevator()
-                self.report_boiler()
                 self.report_office()
                 poll_at = self.clock() + 1
 
@@ -291,7 +257,7 @@ def main():
                     try:
                         gateway.commands.put_nowait(command)
                     except queue.Full:
-                        gateway.emit({'E': 'ELEVERR', 'O': 'OFFICEERR', 'B': 'BOILERR'}[command[0]])
+                        gateway.emit({'E': 'ELEVERR', 'O': 'OFFICEERR'}[command[0]])
             if len(buffer) > 1024:
                 buffer.clear()
     except KeyboardInterrupt:

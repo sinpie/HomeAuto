@@ -12,8 +12,6 @@ constexpr int LCD_RESET_PIN = 5;
 constexpr int LCD_BACKLIGHT_PIN = 23;
 constexpr int TOUCH_SDA_PIN = 7;
 constexpr int TOUCH_SCL_PIN = 8;
-constexpr int TOUCH_RESET_PIN = -1;
-constexpr int TOUCH_INT_PIN = -1;
 // Read the GT911 configuration at startup; do not assume 800x480 or 1024x600.
 constexpr bool TOUCH_SWAP_XY = false;
 constexpr bool TOUCH_MIRROR_X = false;

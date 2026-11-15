@@ -28,8 +28,11 @@ def capture(port):
         if line.startswith('SHOT|'):
             _, w, h = line.split('|')
             w, h = int(w), int(h)
-            data = port.read(w * h * 2)
-            if len(data) != w * h * 2:
+            # The panel may be slow to send while networking is busy: wait up to 60 s.
+            data, total, until = bytearray(), w * h * 2, time.monotonic() + 60
+            while len(data) < total and time.monotonic() < until:
+                data += port.read(total - len(data))
+            if len(data) != total:
                 raise RuntimeError(f'short read: {len(data)} bytes')
             image = Image.new('RGB', (w, h))
             pixels = []

@@ -1,7 +1,6 @@
 import unittest
 from unittest.mock import Mock
-from ha_bridge import (UNKNOWN, Gateway, boiler_values, door_rang, parse_command,
-                       parse_floor, validate_config)
+from ha_bridge import Gateway, door_rang, parse_command, parse_floor, validate_config
 
 
 def drain(gateway):
@@ -15,7 +14,6 @@ class GatewayTests(unittest.TestCase):
     def setUp(self):
         self.config = {
             'base_url': 'http://homeassistant.local:8123',
-            'boiler': 'climate.boiler',
             'office_call': 'script.call_office',
             'elevator': {'floor': 'sensor.elevator_floor', 'call': 'button.elevator_call', 'home_floor': 12},
             'doors': ['binary_sensor.front_door_bell', 'event.lobby_call', None],
@@ -28,13 +26,11 @@ class GatewayTests(unittest.TestCase):
     def test_command_allowlist(self):
         self.assertEqual(parse_command('CMD|E|call'), ('E', 'call'))
         self.assertEqual(parse_command('CMD|O|call'), ('O', 'call'))
-        self.assertEqual(parse_command('CMD|B|off'), ('B', 'off'))
-        self.assertEqual(parse_command('CMD|B|set|235'), ('B', 'set', 235))
-        for line in ['CMD|B|set|500', 'CMD|B|set|233', 'CMD|D|open', 'CMD|E|call|x', 'CMD|0|off']:
+        for line in ['CMD|B|on', 'CMD|B|set|235', 'CMD|D|open', 'CMD|E|call|x', 'CMD|0|off']:
             self.assertIsNone(parse_command(line))
 
     def test_rejects_unsupported_entities(self):
-        for changes in [{'boiler': 'switch.boiler'}, {'office_call': 'lock.door'},
+        for changes in [{'office_call': 'lock.door'},
                         {'elevator': {'floor': 'sensor.f', 'call': 'lock.x', 'home_floor': 3}},
                         {'elevator': {'floor': 'sensor.f', 'call': 'button.x', 'home_floor': 0}},
                         {'doors': ['lock.front', None, None]}]:
@@ -46,11 +42,6 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(parse_floor('B2'), -2)
         for state in ['unknown', '0', 'B0', '', None, '1000']:
             self.assertEqual(parse_floor(state), 0)
-
-    def test_unknown_boiler_is_not_off(self):
-        self.assertEqual(boiler_values({'state': 'unavailable'}), (-1, UNKNOWN, UNKNOWN))
-        self.assertEqual(boiler_values({'state': 'heat', 'attributes': {'current_temperature': 22.5, 'temperature': 24}}),
-                         (1, 225, 240))
 
     def test_door_ring_needs_a_change(self):
         self.assertFalse(door_rang('binary_sensor.a', None, 'on'))  # first read is not a call
@@ -77,16 +68,15 @@ class GatewayTests(unittest.TestCase):
         gateway.request = Mock(side_effect=TimeoutError)
         gateway.execute(('E', 'call'))
         gateway.execute(('O', 'call'))
-        gateway.execute(('B', 'set', 240))
-        self.assertEqual(drain(gateway), ['ELEVERR', 'OFFICEERR', 'BOILERR'])
+        self.assertEqual(drain(gateway), ['ELEVERR', 'OFFICEERR'])
 
     def test_unconfigured_features_do_nothing(self):
-        gateway = self.gateway(boiler=None, office_call=None, elevator=None)
+        gateway = self.gateway(office_call=None, elevator=None)
         gateway.request = Mock()
-        gateway.execute(('B', 'on'))
+        gateway.execute(('E', 'call'))
         gateway.execute(('O', 'call'))
         gateway.request.assert_not_called()
-        self.assertEqual(drain(gateway), ['BOILERR', 'OFFICEERR'])
+        self.assertEqual(drain(gateway), ['ELEVERR', 'OFFICEERR'])
 
     def test_office_call_expires(self):
         gateway = self.gateway()
@@ -96,14 +86,6 @@ class GatewayTests(unittest.TestCase):
         self.now[0] += 31
         gateway.report_office()
         self.assertEqual(drain(gateway), ['OFFICE|0'])
-
-    def test_boiler_target_service(self):
-        gateway = self.gateway()
-        gateway.request = Mock(return_value={'state': 'heat', 'attributes': {'temperature': 24}})
-        gateway.execute(('B', 'set', 240))
-        self.assertEqual(gateway.request.call_args_list[0].args,
-                         ('services/climate/set_temperature', {'entity_id': 'climate.boiler', 'temperature': 24.0}))
-        self.assertEqual(drain(gateway), ['BOILOK', f'BOIL|1|{UNKNOWN}|240'])
 
 
 if __name__ == '__main__':
