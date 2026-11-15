@@ -1,0 +1,33 @@
+# Home-specific settings (EW11 address etc.)
+HomePanel/local_config.h
+bridge.json
+
+# Captured bus traffic from this home
+tools/rs485-logs/
+
+# Device flash backups (may contain network settings)
+device-backup/
+
+# Vendor package (manufacturer's copyright, ~350 MB) and old source bundle
+JC1060P470C_I_W_Y.zip
+HomePanel_ESP32P4_source.zip
+
+# Build output, toolchains, caches
+build/
+build-New/
+build-Old/
+.cache/
+.arduino/
+.tools/
+__pycache__/
+*.pyc
+
+# Machine-specific config, logs and diagnostics (contain local user paths)
+arduino-local.yaml
+arduino-cli.yaml
+compile-*.log
+toolchain-diagnostics-*.json
+
+# Generated previews and downloaded source photos (re-created by tools/make_assets.py)
+tools/preview/
+tools/photos/

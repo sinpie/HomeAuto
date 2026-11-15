@@ -1,0 +1,8 @@
+{
+  "port": "COM3",
+  "base_url": "http://homeassistant.local:8123",
+  "boiler": null,
+  "office_call": null,
+  "elevator": null,
+  "doors": [null, null, null]
+}
