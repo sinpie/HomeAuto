@@ -3,12 +3,14 @@
 #include <ETH.h>
 #include <WiFi.h>
 #include <NetworkClient.h>
+#include <initializer_list>
 
 // Samsung SDS wallpad packets (as observed on this home's bus, 9600 8E1):
 //   a packet starts with a byte >= 0x80; the last byte is the XOR of the
 //   preceding bytes with bit 7 cleared.
 //   heating status reply: B0 7C <group> <on 0/1> <set C> <current C> FF <chk>
-// Nothing is ever written to the TCP socket: receive only.
+// The socket is only written by the command sender: the device commands built by
+// the wallpad*() functions below, one at a time, on explicit request.
 
 namespace {
 // Board Ethernet (vendor ethernet example): IP101 PHY, MDC 31, MDIO 52, reset 51,
@@ -40,6 +42,17 @@ uint32_t packets = 0, badBytes = 0;
 // Last wallpad -> device packet: a device reply (B0 ..) is interpreted in its context.
 uint8_t queryHead = 0, queryCmd = 0, queryArg = 0;
 uint32_t lastRingAt[3] = {};
+
+// Pending device command (one at a time). Sent in a free bus slot, retried until the
+// addressed device answers with the expected reply command.
+constexpr uint8_t CMD_MAX_ATTEMPTS = 5;
+constexpr uint32_t CMD_REPLY_MS = 1500;
+uint8_t cmdPacket[10];
+int cmdLength = 0;
+uint8_t expectReply1 = 0, expectReply2 = 0, expectGroup = 0xFF;  // 0xFF: any group
+volatile bool cmdRequested = false;
+uint32_t cmdSentAt = 0;
+bool sendSlot = false;  // the wallpad just polled a device that does not answer: the bus is free
 
 void startWifi() {
   ownDisconnect = true;  // the reason-8 event this causes is not the failure we want to see
@@ -113,6 +126,7 @@ bool isIntercom(uint8_t head) { return head >= 0xA1 && head <= 0xA6; }
 void wallpadPacket(const uint8_t* p, int n, uint32_t now) {
   queryHead = p[0]; queryCmd = p[1]; queryArg = n > 2 ? p[2] : 0;
   const uint8_t head = p[0], cmd = p[1];
+  sendSlot = cmd == 0x5A && head != 0xAE;
 
   if(isIntercom(head) && n == 4) {
     IntercomState& ic = shared.intercom;
@@ -161,6 +175,16 @@ void wallpadPacket(const uint8_t* p, int n, uint32_t now) {
 
 // Device -> wallpad reply (B0 ..), read in the context of the preceding query.
 void deviceReply(const uint8_t* p, int n, uint32_t now) {
+  sendSlot = false;
+  CommandStatus& cmd = shared.command;
+  if(cmd.state == CMD_SENDING && n >= 3 && (p[1] == expectReply1 || p[1] == expectReply2) &&
+     (expectGroup == 0xFF || p[2] == expectGroup)) {
+    cmd.state = CMD_DONE;
+    cmd.at = now;
+    if(cmd.kind == CMD_GAS_CLOSE) { shared.gas.seen = true; shared.gas.at = now; shared.gas.closedAt = now; return; }
+    // Our own command is not echoed back, so read the reply in its context.
+    queryHead = cmdPacket[0]; queryCmd = cmdPacket[1]; queryArg = cmdPacket[2];
+  }
   // Heating: B0 7C|7D|7F GR TG SET CUR FF PT (carries its own group id)
   if(n==8 && (p[1]==0x7C || p[1]==0x7D || p[1]==0x7F) && p[2]>=1 && p[2]<=HEAT_ZONES && p[3]<=1) {
     HeatZone& z = shared.zones[p[2]-1];
@@ -182,8 +206,9 @@ void deviceReply(const uint8_t* p, int n, uint32_t now) {
       break;
     }
     case 0xAB:  // gas valve: AB 41 00 -> B0 41 XX (00 open, 01 closed); AB 78 (close) -> B0 78
-      if(n==4 && queryCmd==0x41 && p[1]==0x41 && p[2]<=1) shared.gas = {true, p[2]==1, now};
-      else if(n==4 && queryCmd==0x78 && p[1]==0x78) shared.gas = {true, true, now};
+      // AB 41 -> B0 41 XX: the controller is present (XX did not follow the valve here)
+      if(n==4 && queryCmd==0x41 && p[1]==0x41) { shared.gas.seen = true; shared.gas.at = now; }
+      else if(n==4 && queryCmd==0x78 && p[1]==0x78) { shared.gas.seen = true; shared.gas.at = now; shared.gas.closedAt = now; }
       break;
     case 0xAC:  // lights
       if(n==5 && queryCmd==0x79 && p[1]==0x79) {
@@ -338,6 +363,29 @@ void linkTask(void*) {
       lastByte = millis();
     }
     publish(WALLPAD_CONNECTED, uint32_t(ip));
+    if(cmdRequested) {
+      portENTER_CRITICAL(&lock);
+      const bool waiting = shared.command.state == CMD_SENDING;
+      const uint8_t attempts = shared.command.attempts;
+      portEXIT_CRITICAL(&lock);
+      if(!waiting) cmdRequested = false;  // answered (done) by the parser
+      else if(attempts == 0 || millis() - cmdSentAt > CMD_REPLY_MS) {
+        if(attempts >= CMD_MAX_ATTEMPTS) {
+          portENTER_CRITICAL(&lock);
+          shared.command.state = CMD_FAILED;
+          shared.command.at = millis();
+          portEXIT_CRITICAL(&lock);
+          cmdRequested = false;
+        } else if(sendSlot) {
+          client.write(cmdPacket, cmdLength);
+          cmdSentAt = millis();
+          sendSlot = false;
+          portENTER_CRITICAL(&lock);
+          ++shared.command.attempts;
+          portEXIT_CRITICAL(&lock);
+        }
+      }
+    }
     const int available = client.available();
     if(available > 0) {
       uint8_t chunk[128];
@@ -408,6 +456,50 @@ void wallpadDiagnose(Print& out, const char* targetSsid, bool scan) {
     WiFi.scanDelete();
   }
   out.println("NET|done");
+}
+
+// Queue one command packet (checksum appended). Only the builders below call this.
+bool startCommand(CommandKind kind, uint8_t target, std::initializer_list<uint8_t> body,
+                  uint8_t reply1, uint8_t reply2, uint8_t group) {
+  if(body.size() + 1 > sizeof(cmdPacket)) return false;
+  bool ok = false;
+  portENTER_CRITICAL(&lock);
+  if(shared.state == WALLPAD_CONNECTED && shared.command.state != CMD_SENDING) {
+    int n = 0; uint8_t x = 0;
+    for(uint8_t b : body) { cmdPacket[n++] = b; x ^= b; }
+    cmdPacket[n++] = x & 0x7F;
+    cmdLength = n;
+    expectReply1 = reply1; expectReply2 = reply2; expectGroup = group;
+    shared.command = {CMD_SENDING, kind, target, 0, millis()};
+    ok = true;
+  }
+  portEXIT_CRITICAL(&lock);
+  if(ok) cmdRequested = true;
+  return ok;
+}
+
+bool wallpadCloseGas() {
+  return startCommand(CMD_GAS_CLOSE, 0, {0xAB, 0x78, 0x00}, 0x78, 0x78, 0xFF);
+}
+bool wallpadHeatingPower(uint8_t group, bool on) {
+  if(group < 1 || group > HEAT_ZONES) return false;
+  return startCommand(CMD_HEAT_POWER, group, {0xAE, 0x7D, group, uint8_t(on), 0, 0, 0}, 0x7D, 0x7D, group);
+}
+bool wallpadHeatingSet(uint8_t group, uint8_t celsius) {
+  if(group < 1 || group > HEAT_ZONES || celsius < 10 || celsius > 30) return false;
+  return startCommand(CMD_HEAT_SET, group, {0xAE, 0x7F, group, celsius, 0, 0, 0}, 0x7F, 0x7F, group);
+}
+bool wallpadLight(uint8_t group, bool on) {
+  if(group > LIGHT_GROUPS || (group == 0 && on)) return false;
+  return startCommand(CMD_LIGHT, group, {0xAC, 0x7A, group, uint8_t(on)}, 0x79, 0x7A, group);
+}
+bool wallpadOutletPower(uint8_t outlet, bool on) {
+  if(outlet < 1 || outlet > OUTLETS) return false;
+  return startCommand(CMD_OUTLET, outlet, {0xC6, 0x6E, outlet, uint8_t(on), 0, 0, 0, 0, 0}, 0x6E, 0x6E, outlet);
+}
+bool wallpadVent(uint8_t code) {
+  if(code < 1 || code > 6) return false;
+  return startCommand(CMD_VENT, code, {0xC2, 0x4F, code, 0, 0}, 0x4F, 0x4F, 0xFF);
 }
 
 WallpadSnapshot wallpadSnapshot() {

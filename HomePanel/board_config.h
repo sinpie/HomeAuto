@@ -34,5 +34,13 @@ constexpr bool TOUCH_MIRROR_Y = false;
 #ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD ""
 #endif
+#ifndef WEATHER_PLACE
+#define WEATHER_PLACE ""         // empty: estimate the location from the public IP
+#define WEATHER_LAT 0.0f
+#define WEATHER_LON 0.0f
+#endif
+#ifndef WEATHER_UTC_OFFSET
+#define WEATHER_UTC_OFFSET (9 * 3600)  // Korea
+#endif
 constexpr const char* WALLPAD_HOST = WALLPAD_EW11_HOST;
 constexpr uint16_t WALLPAD_PORT = WALLPAD_EW11_PORT;

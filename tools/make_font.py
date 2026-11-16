@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = r'C:\Windows\Fonts\NotoSansKR-VF.ttf'
 ASCII = ''.join(chr(c) for c in range(32, 127))
-DIGITS = '0123456789.-°B% '
+DIGITS = '0123456789.-°B%: '
 # name, pixel size, weight, character set ('ui' = ASCII + every literal in the firmware)
 # The order is the font id used by the firmware (assets.cpp).
 FONTS = [
@@ -26,7 +26,8 @@ FONTS = [
 
 def ui_chars():
     literals = ''
-    for path in sorted((ROOT/'HomePanel').glob('*.cpp')):
+    # .cpp literals plus headers (local_config.h holds the weather place name)
+    for path in sorted((ROOT/'HomePanel').glob('*.cpp')) + sorted((ROOT/'HomePanel').glob('*.h')):
         literals += ''.join(re.findall(r'"([^"\n]*)"', path.read_text(encoding='utf-8')))
     return sorted(set(ASCII + literals + '°·'))
 

@@ -98,14 +98,14 @@ void centerText(int x,int y,int w,const char* s,uint16_t c,const Font& f) { text
 void rightText(int right,int y,const char* s,uint16_t c,const Font& f) { text(right-textWidth(s,f), y, s, c, f); }
 
 // ---------- icons ----------
-void icon(IconId id,IconSize size,int x,int y,uint16_t color) {
+void icon(IconId id,IconSize size,int x,int y,uint16_t color,unsigned alpha) {
   if(!ICON_BITMAP) return;  // assets not loaded
   const int n = ICON_SIZES[size], stride = (n+1)/2;
   const uint8_t* p = ICON_BITMAP + ICON_OFFSETS[id*ICON_SIZE_COUNT + size];
   for(int yy=0; yy<n; ++yy, p+=stride)
     for(int xx=0; xx<n; ++xx) {
       const unsigned a = (xx&1) ? (p[xx>>1]&15) : (p[xx>>1]>>4);
-      if(a) plot(x+xx, y+yy, color, a==15 ? 256 : a*17);
+      if(a) plot(x+xx, y+yy, color, (a==15 ? 256 : a*17) * alpha / 256);
     }
 }
 void iconCenter(IconId id,IconSize size,int cx,int cy,uint16_t color) {
@@ -122,4 +122,35 @@ void button(int x,int y,int w,int h,const char* label,uint16_t fill,unsigned alp
   int tx = x + (w-tw)/2;
   if(iconId>=0) { iconCenter(IconId(iconId), S24, tx+12, y+h/2, ink); tx += 32; }
   text(tx, y+(h-FONT_BODY.height)/2, label, ink);
+}
+
+void disc(float cx,float cy,float r,uint16_t c,unsigned alpha,float clipY) {
+  const int y0 = int(cy - r - 1), y1 = int(cy + r + 1), x0 = int(cx - r - 1), x1 = int(cx + r + 1);
+  for(int py=y0; py<=y1; ++py) {
+    if(py + 0.5f > clipY) break;
+    for(int px=x0; px<=x1; ++px) {
+      const float dx = px + 0.5f - cx, dy = py + 0.5f - cy;
+      const float cov = std::min(1.f, std::max(0.f, r + 0.5f - sqrtf(dx*dx + dy*dy)));
+      if(cov > 0) plot(px, py, c, unsigned(alpha * cov));
+    }
+  }
+}
+
+void moonDisc(float cx,float cy,float r,float age,uint16_t lit,uint16_t dark,unsigned darkAlpha) {
+  const float theta = 2 * float(M_PI) * age / 29.530588853f;
+  const bool waxing = theta < float(M_PI);
+  const float k = cosf(theta);
+  const int y0 = int(cy - r - 1), y1 = int(cy + r + 1), x0 = int(cx - r - 1), x1 = int(cx + r + 1);
+  for(int py=y0; py<=y1; ++py)
+    for(int px=x0; px<=x1; ++px) {
+      const float dx = px + 0.5f - cx, dy = py + 0.5f - cy;
+      const float cov = std::min(1.f, std::max(0.f, r + 0.5f - sqrtf(dx*dx + dy*dy)));
+      if(cov <= 0) continue;
+      // terminator: x = ry*cos(theta) (waxing, lit to the right) / mirrored while waning
+      const float ry = sqrtf(std::max(0.f, r*r - dy*dy));
+      const float edge = waxing ? (dx - ry * k) : (-ry * k - dx);
+      const float litCov = std::min(1.f, std::max(0.f, edge + 0.5f));
+      plot(px, py, dark, unsigned(darkAlpha * cov));
+      if(litCov > 0) plot(px, py, lit, unsigned(256 * cov * litCov));
+    }
 }

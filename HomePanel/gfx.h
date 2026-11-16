@@ -13,7 +13,7 @@ constexpr uint16_t TEXT=rgb(0xF8FAFC), MUTED=rgb(0xB6C2D9), FAINT=rgb(0x8C99B5);
 constexpr uint16_t ACCENT=rgb(0x34D399), ON_ACCENT=rgb(0x052E21), WARN=rgb(0xFBBF24), ON_WARN=rgb(0x3B2503);
 constexpr uint16_t DANGER=rgb(0xF87171), HEAT=rgb(0xFB923C), ON_HEAT=rgb(0x3A1503);
 
-enum IconSize { S24, S32, S56 };
+enum IconSize { S24, S32, S56, S80 };
 
 void gfxSetTarget(uint16_t* frame);  // frame buffer the functions below draw into
 
@@ -32,7 +32,13 @@ void text(int x,int y,const char* s,uint16_t color,const Font& f=FONT_BODY);
 void centerText(int x,int y,int w,const char* s,uint16_t c,const Font& f=FONT_BODY);
 void rightText(int right,int y,const char* s,uint16_t c,const Font& f=FONT_BODY);
 
-void icon(IconId id,IconSize size,int x,int y,uint16_t color);
+void icon(IconId id,IconSize size,int x,int y,uint16_t color,unsigned alpha=256);
 void iconCenter(IconId id,IconSize size,int cx,int cy,uint16_t color);
 void iconChip(int x,int y,IconId id,uint16_t fill,unsigned alpha,uint16_t ink);  // 52x52 rounded tile
 void button(int x,int y,int w,int h,const char* label,uint16_t fill,unsigned alpha,uint16_t ink,int iconId=-1);
+
+// Anti-aliased filled disc; pixels below clipY (screen y) are skipped (horizon).
+void disc(float cx,float cy,float r,uint16_t c,unsigned alpha=256,float clipY=1e9f);
+// Moon at its real phase: age in days (0 new .. 14.77 full .. 29.53). The lit side is
+// on the right while waxing, on the left while waning (northern hemisphere).
+void moonDisc(float cx,float cy,float r,float age,uint16_t lit,uint16_t dark,unsigned darkAlpha);
