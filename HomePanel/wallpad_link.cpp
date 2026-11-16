@@ -47,11 +47,13 @@ uint32_t lastRingAt[3] = {};
 // addressed device answers with the expected reply command.
 constexpr uint8_t CMD_MAX_ATTEMPTS = 5;
 constexpr uint32_t CMD_REPLY_MS = 1500;
+constexpr uint32_t CMD_TOTAL_MS = 15000;   // no free bus slot or no reply: give up
 uint8_t cmdPacket[10];
 int cmdLength = 0;
 uint8_t expectReply1 = 0, expectReply2 = 0, expectGroup = 0xFF;  // 0xFF: any group
 volatile bool cmdRequested = false;
 uint32_t cmdSentAt = 0;
+bool justSent = false;   // our packet went out and no wallpad packet followed yet: the next reply is ours
 bool sendSlot = false;  // the wallpad just polled a device that does not answer: the bus is free
 
 void startWifi() {
@@ -97,7 +99,7 @@ void expireZones() {
   for(OutletState& o : shared.outlets) stale(o.seen, o.at, DEVICE_STALE_MS);
   stale(shared.vent.seen, shared.vent.at, DEVICE_STALE_MS);
   for(EnergyState& e : shared.energy) stale(e.seen, e.at, DEVICE_STALE_MS);
-  stale(shared.intercom.seen, shared.intercom.at, DEVICE_STALE_MS);
+  stale(shared.intercom.seen, shared.intercom.seenAt, DEVICE_STALE_MS);
   stale(shared.entrance.seen, shared.entrance.at, DEVICE_STALE_MS);
   // A ring or call that is no longer refreshed by the wallpad is over.
   if(shared.intercom.phase != INTERCOM_IDLE && now - shared.intercom.at > 60000) shared.intercom.phase = INTERCOM_IDLE;
@@ -124,6 +126,7 @@ bool isIntercom(uint8_t head) { return head >= 0xA1 && head <= 0xA6; }
 // Wallpad -> device packet. Records the query context and the events the wallpad
 // announces to intercoms and entrance switches.
 void wallpadPacket(const uint8_t* p, int n, uint32_t now) {
+  justSent = false;   // the wallpad spoke after our packet: a later reply answers its query
   queryHead = p[0]; queryCmd = p[1]; queryArg = n > 2 ? p[2] : 0;
   const uint8_t head = p[0], cmd = p[1];
   sendSlot = cmd == 0x5A && head != 0xAE;
@@ -177,11 +180,15 @@ void wallpadPacket(const uint8_t* p, int n, uint32_t now) {
 void deviceReply(const uint8_t* p, int n, uint32_t now) {
   sendSlot = false;
   CommandStatus& cmd = shared.command;
-  if(cmd.state == CMD_SENDING && n >= 3 && (p[1] == expectReply1 || p[1] == expectReply2) &&
+  // Only a reply that directly follows our own packet counts (an ordinary poll reply has the
+  // same shape and must not mark the command done before it was sent).
+  const bool ours = justSent && cmd.attempts > 0;
+  justSent = false;
+  if(cmd.state == CMD_SENDING && ours && n >= 3 && (p[1] == expectReply1 || p[1] == expectReply2) &&
      (expectGroup == 0xFF || p[2] == expectGroup)) {
     cmd.state = CMD_DONE;
     cmd.at = now;
-    if(cmd.kind == CMD_GAS_CLOSE) { shared.gas.seen = true; shared.gas.at = now; shared.gas.closedAt = now; return; }
+    if(cmd.kind == CMD_GAS_CLOSE) { shared.gas.seen = true; shared.gas.at = now; shared.gas.closedAt = uint64_t(esp_timer_get_time() / 1000); return; }
     // Our own command is not echoed back, so read the reply in its context.
     queryHead = cmdPacket[0]; queryCmd = cmdPacket[1]; queryArg = cmdPacket[2];
   }
@@ -193,9 +200,8 @@ void deviceReply(const uint8_t* p, int n, uint32_t now) {
   }
   if(isIntercom(queryHead)) {  // an intercom answers
     IntercomState& ic = shared.intercom;
-    ic.seen = true;
+    ic.seen = true; ic.seenAt = now;
     if(p[1] == 0x42 || p[1] == 0x36) { ic.phase = INTERCOM_CALL; ic.at = now; }
-    else if(ic.at == 0) ic.at = now;
     return;
   }
   switch(queryHead) {
@@ -208,7 +214,7 @@ void deviceReply(const uint8_t* p, int n, uint32_t now) {
     case 0xAB:  // gas valve: AB 41 00 -> B0 41 XX (00 open, 01 closed); AB 78 (close) -> B0 78
       // AB 41 -> B0 41 XX: the controller is present (XX did not follow the valve here)
       if(n==4 && queryCmd==0x41 && p[1]==0x41) { shared.gas.seen = true; shared.gas.at = now; }
-      else if(n==4 && queryCmd==0x78 && p[1]==0x78) { shared.gas.seen = true; shared.gas.at = now; shared.gas.closedAt = now; }
+      else if(n==4 && queryCmd==0x78 && p[1]==0x78) { shared.gas.seen = true; shared.gas.at = now; shared.gas.closedAt = uint64_t(esp_timer_get_time() / 1000); }
       break;
     case 0xAC:  // lights
       if(n==5 && queryCmd==0x79 && p[1]==0x79) {
@@ -339,9 +345,16 @@ void linkTask(void*) {
   auto publish = [&](WallpadLinkState s, uint32_t ip) {
     if(s != state || ip != stateIp) { state = s; stateIp = ip; setState(s, ip); }
   };
+  auto failPending = []() {
+    portENTER_CRITICAL(&lock);
+    if(shared.command.state == CMD_SENDING) { shared.command.state = CMD_FAILED; shared.command.at = millis(); }
+    cmdRequested = false;
+    portEXIT_CRITICAL(&lock);
+  };
   for(;;) {
     expireZones();
     if(!linkUp()) {
+      failPending();
       client.stop();
       publish(useWifi ? WALLPAD_NO_WIFI : WALLPAD_NO_CABLE, 0);
       // A single WiFi.begin() at boot can be lost (coprocessor link still starting,
@@ -351,33 +364,38 @@ void linkTask(void*) {
       continue;
     }
     const IPAddress ip = localIp();
-    if(ip == IPAddress(0,0,0,0)) { client.stop(); publish(WALLPAD_NO_IP, 0); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+    if(ip == IPAddress(0,0,0,0)) { failPending(); client.stop(); publish(WALLPAD_NO_IP, 0); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
     updateRssi();
     if(client.connected() && millis() - lastByte > SILENT_RECONNECT_MS) client.stop();  // EW11 gone
     if(!client.connected()) {
       publish(WALLPAD_CONNECTING, uint32_t(ip));
       client.stop();
       len = 0;
-      if(!client.connect(targetHost, targetPort, 3000)) { vTaskDelay(pdMS_TO_TICKS(3000)); continue; }
+      if(!client.connect(targetHost, targetPort, 3000)) { failPending(); vTaskDelay(pdMS_TO_TICKS(3000)); continue; }
       client.setNoDelay(true);
+      sendSlot = false; justSent = false; queryHead = 0;   // nothing from before the reconnect counts
       lastByte = millis();
     }
     publish(WALLPAD_CONNECTED, uint32_t(ip));
     if(cmdRequested) {
+      // Read the state and clear the request in one critical section: a new command
+      // queued by the UI in between must not be dropped.
       portENTER_CRITICAL(&lock);
       const bool waiting = shared.command.state == CMD_SENDING;
       const uint8_t attempts = shared.command.attempts;
-      portEXIT_CRITICAL(&lock);
+      const uint32_t startedAt = shared.command.at;
       if(!waiting) cmdRequested = false;  // answered (done) by the parser
-      else if(attempts == 0 || millis() - cmdSentAt > CMD_REPLY_MS) {
-        if(attempts >= CMD_MAX_ATTEMPTS) {
+      portEXIT_CRITICAL(&lock);
+      if(waiting && (attempts == 0 || millis() - cmdSentAt > CMD_REPLY_MS)) {
+        if(attempts >= CMD_MAX_ATTEMPTS || millis() - startedAt > CMD_TOTAL_MS) {
           portENTER_CRITICAL(&lock);
           shared.command.state = CMD_FAILED;
           shared.command.at = millis();
-          portEXIT_CRITICAL(&lock);
           cmdRequested = false;
-        } else if(sendSlot) {
+          portEXIT_CRITICAL(&lock);
+        } else if(sendSlot && len == 0 && millis() - lastByte >= 30) {
           client.write(cmdPacket, cmdLength);
+          justSent = true;
           cmdSentAt = millis();
           sendSlot = false;
           portENTER_CRITICAL(&lock);
@@ -429,7 +447,7 @@ void wallpadBegin(const char* host, uint16_t port, const char* ssid, const char*
     }
     setState(WALLPAD_NO_CABLE, 0);
   }
-  xTaskCreate(linkTask, "wallpad", 6144, nullptr, 4, nullptr);
+  xTaskCreatePinnedToCore(linkTask, "wallpad", 6144, nullptr, 4, nullptr, 0);   // core 0, next to the network stack
 }
 
 void wallpadDiagnose(Print& out, const char* targetSsid, bool scan) {
@@ -471,10 +489,10 @@ bool startCommand(CommandKind kind, uint8_t target, std::initializer_list<uint8_
     cmdLength = n;
     expectReply1 = reply1; expectReply2 = reply2; expectGroup = group;
     shared.command = {CMD_SENDING, kind, target, 0, millis()};
+    cmdRequested = true;
     ok = true;
   }
   portEXIT_CRITICAL(&lock);
-  if(ok) cmdRequested = true;
   return ok;
 }
 

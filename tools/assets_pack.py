@@ -12,6 +12,9 @@ Layout (little endian, every section 4-byte aligned):
   type 1  background: u16 width, u16 height, u32 0, RGB565 pixels
   type 2  icons:      u16 icon_count, u16 size_count, u8 sizes[4], u32 offsets[icon*size_count+size], 4-bit bitmap
   type 3  font:       u16 font_id, u16 height, u32 glyph_count, glyphs (u32 code, u16 advance, u16 0, u32 offset), 4-bit bitmap
+  type 4  moon map:   u16 level_count, u16 0, levels (u16 size, u16 0, u32 colour offset, u32 relief offset),
+                      RGB565 size x size and int8 relief (x slope x 64) size x size per level
+                      (tools/make_moon.py: the near side as seen from Earth, largest level first)
 """
 import struct
 import sys
@@ -48,6 +51,18 @@ def section_icons():
     return head + struct.pack(f'<{len(offsets)}I', *offsets) + bitmap
 
 
+def section_moon():
+    import make_moon
+    levels = make_moon.mipmaps()
+    head = struct.pack('<HH', len(levels), 0)
+    table, data = b'', b''
+    offset = 4 + 12 * len(levels)
+    for size, pixels, relief in levels:
+        table += struct.pack('<HHII', size, 0, offset + len(data), offset + len(data) + len(pixels))
+        data += pixels + relief
+    return head + table + data
+
+
 def section_font(font_id, height, glyphs, bitmap):
     table = b''.join(struct.pack('<IHxxI', code, advance, offset) for code, advance, offset in glyphs)
     return struct.pack('<HHI', font_id, height, len(glyphs)) + table + bitmap
@@ -72,7 +87,7 @@ def write_header():
 
 def pack():
     import make_font
-    sections = [(1, section_background()), (2, section_icons())]
+    sections = [(1, section_background()), (2, section_icons()), (4, section_moon())]
     for font_id, (height, glyphs, bitmap) in enumerate(make_font.build_all()):
         sections.append((3, section_font(font_id, height, glyphs, bitmap)))
     offset = 16 + 12 * len(sections)

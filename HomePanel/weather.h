@@ -1,6 +1,8 @@
 #pragma once
 #include <stdint.h>
 #include <time.h>
+#include <stddef.h>
+#include "astro.h"
 
 // Internet time and weather.
 //  - Location: configured in local_config.h (WEATHER_LAT/LON/PLACE); otherwise
@@ -24,6 +26,7 @@ struct WeatherDay {
 struct WeatherData {
   bool valid;
   uint32_t fetchedAt;              // millis() of the last successful update
+  time_t firstNoon;                // local noon of days[0]: hours[0] is that day's 00:00
   char place[48];                  // "city, region" from the IP lookup
   float lat, lon;
   float temp, feels, wind;         // °C, °C, m/s
@@ -48,8 +51,34 @@ bool localNow(struct tm& out);        // local time, false if not set
 const char* weatherText(uint8_t code);
 int weatherSeverity(uint8_t code);
 
-// Sun elevation in degrees for the given location and UTC time.
-float sunElevation(float lat, float lon, time_t utc);
-// Moon: age in days (0..29.5) and illuminated fraction (0..1) at a UTC time.
-void moonPhase(time_t utc, float& age, float& illumination);
+// Location picked on the panel (saved in flash, wins over local_config.h): the task
+// looks up its place name, refetches the weather and recomputes the eclipses.
+void weatherSetLocation(float lat, float lon);
+bool weatherLocationPending();
+void weatherRequestIpLocation();                 // IP-based estimate for the location picker
+bool weatherIpLocation(float& lat, float& lon);  // false until it arrived
+bool weatherIpFailed();                          // the last IP lookup failed (offline, server error)
+void weatherLocation(float& lat, float& lon, char* place, size_t n);
+// Place search for the location picker (OpenStreetMap Nominatim, Korean names first).
+struct PlaceResult { char name[160]; float lat, lon; };
+enum SearchState : uint8_t { SEARCH_IDLE, SEARCH_BUSY, SEARCH_DONE, SEARCH_FAILED };
+void weatherSearch(const char* query);              // UTF-8; replaces a running search
+SearchState weatherSearchResults(PlaceResult* out, int max, int& count);
+// Upcoming eclipses for the location (astro.h); empty until the first search finished.
+int weatherEclipses(Eclipse* out, int max);
+
+// Today's sky for the sun & moon card: azimuth/altitude every 10 minutes from 12 h before
+// local midnight to 12 h after the next one (so a path around "now" is never cut at
+// midnight), and the day's rise/set times. Computed by the weather task once a day.
+constexpr int SKY_STEPS = 289;
+constexpr long SKY_START_OFFSET = -12 * 3600;   // first sample relative to local midnight
+struct SkyDay {
+  time_t day; float lat, lon;
+  float sunAz[SKY_STEPS], sunAlt[SKY_STEPS], moonAz[SKY_STEPS], moonAlt[SKY_STEPS];
+  time_t sunRise, sunSet, moonRise, moonSet;
+};
+void computeSkyDay(time_t dayStart, float lat, float lon, SkyDay& out);
+bool weatherSkyDay(SkyDay& out);   // false until the first one is ready
+
+// Moon phase name for an age in days (astro.h moonAge).
 const char* moonPhaseName(float age);

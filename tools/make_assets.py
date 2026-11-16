@@ -190,6 +190,21 @@ def icon_bell(p):
     p.line((0.5, 0.12), (0.5, 0.20))
 
 
+def icon_search(p):
+    p.arc(0.44, 0.44, 0.24, 0, 360)
+    p.line((0.62, 0.62), (0.84, 0.84))
+
+
+def icon_backspace(p):
+    p.line((0.08, 0.5), (0.30, 0.24), (0.88, 0.24), (0.88, 0.76), (0.30, 0.76), closed=True)
+    p.line((0.48, 0.38), (0.70, 0.62))
+    p.line((0.70, 0.38), (0.48, 0.62))
+
+
+def icon_shift(p):
+    p.line((0.5, 0.12), (0.86, 0.50), (0.66, 0.50), (0.66, 0.84), (0.34, 0.84), (0.34, 0.50), (0.14, 0.50), closed=True)
+
+
 def icon_gear(p):
     pts = []
     teeth = 8
@@ -507,7 +522,7 @@ ICONS = [('HOME', icon_home), ('FLAME', icon_flame), ('BELL', icon_bell), ('GEAR
          ('WX_RAIN', wx_rain), ('WX_RAIN_HEAVY', wx_rain_heavy), ('WX_DRIZZLE', wx_drizzle), ('WX_SNOW', wx_snow),
          ('WX_SLEET', wx_sleet), ('WX_BOLT', wx_bolt), ('WX_FOG', wx_fog),
          ('WX_TWILIGHT_RAYS', wx_twilight_rays), ('WX_HORIZON', wx_horizon), ('WX_ARROW_UP', wx_arrow_up),
-         ('WX_ARROW_DOWN', wx_arrow_down)]
+         ('WX_ARROW_DOWN', wx_arrow_down), ('SEARCH', icon_search), ('BACKSPACE', icon_backspace), ('SHIFT', icon_shift)]
 
 
 def pack4(image):

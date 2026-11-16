@@ -13,7 +13,7 @@ HomePanel: ESP32-P4 7인치 월패드 보조 패널(Arduino-ESP32 3.3.7). 개요
    버스 기록(`tools/rs485-logs/`), 플래시 백업, 제조사 ZIP, 빌드 산출물도 제외. 커밋 전 `git grep`으로 IP·이메일·MAC 확인.
    커밋 작성자 이메일은 GitHub no-reply 주소.
 3. **모르는 값은 모른다고 표시**하고, 명령 성공은 장치 응답으로만 판단할 것.
-4. **실기기에서 확인**: 화면은 `tools/screenshot.py`로 캡처해서 보고, 상태는 시리얼 `NET`/`DEV`/`ASSETS`로 확인.
+4. **실기기에서 확인**: 화면은 `tools/screenshot.py`로 캡처해서 보고, 상태는 시리얼 `NET`/`DEV`/`ASSETS`/`PERF`로 확인.
    확인하지 못한 것은 확인하지 못했다고 보고.
 
 ## 빌드·업로드
@@ -34,7 +34,8 @@ HomePanel: ESP32-P4 7인치 월패드 보조 패널(Arduino-ESP32 3.3.7). 개요
 - 진입점은 `app.cpp`(`HomePanel.ino`는 비움). 그리기 함수는 `gfx`, 네트워크·버스는 `wallpad_link`, 인터넷은 `weather`.
 - 태스크 ↔ UI는 **스냅샷 복사**로만 주고받음(임계 구역/뮤텍스). UI 루프에서 블로킹 네트워크 호출 금지.
 - 화면은 내용이 바뀔 때만 다시 그림(서명 비교). 정지 화면을 주기적으로 다시 그리지 말 것(깜빡임).
-- 터치 영역 44px 이상, 같은 종류 카드는 같은 크기, 강조색은 하나. UI 문구를 바꾸면 `py -3 tools\make_font.py`.
+- 무거운 계산·네트워크는 코어 0 작업에서(긴 계산은 `vTaskDelay(1)`로 양보). UI 루프(코어 1)는 그리기만.
+- 터치 영역 44px 이상(7인치: 1px ≈ 0.15mm), 같은 종류 카드는 같은 크기, 강조색은 하나. UI 문구를 바꾸면 `py -3 tools\make_font.py`.
 - `millis()` 비교는 뺄셈으로(랩어라운드 안전). 오래 지나는 시각(방문 호출 등)은 64비트.
 - 쉘에서 C++ 소스를 고칠 때 heredoc 안의 `\n`이 실제 줄바꿈으로 바뀌는 사고가 있었음 → 패치는 파일로 작성한 스크립트나 편집 도구로.
 
@@ -47,6 +48,8 @@ HomePanel: ESP32-P4 7인치 월패드 보조 패널(Arduino-ESP32 3.3.7). 개요
 | `NET` / `NET SCAN` | 연결 방식·상태·패킷 수·WiFi 끊김 이유 / + 주변 WiFi 개수 |
 | `DEV` | 장치별 수신 상태, 마지막 명령 상태 |
 | `ASSETS` | 자원 로드 결과 |
+| `PERF` | 그리기 시간(구간별)·루프 멈춤·메모리·작업별 스택·지도 타일 통계 (최댓값 초기화) |
+| `PAN|dx|dy` | 지도 드래그 한 프레임 흉내(측정용) |
 
 ## PC 도구
 
@@ -54,7 +57,7 @@ HomePanel: ESP32-P4 7인치 월패드 보조 패널(Arduino-ESP32 3.3.7). 개요
 |---|---|
 | `tools/rs485_log.py` | EW11에서 버스 수신 기록·분석(송신 안 함), `--mark`로 동작 시점 표시 |
 | `tools/screenshot.py` | 화면 캡처, 터치 흉내 |
-| `tools/assets_pack.py`, `make_font.py`, `make_assets.py` | 화면 자원 생성 |
+| `tools/assets_pack.py`, `make_font.py`, `make_assets.py`, `make_moon.py` | 화면 자원 생성 (달 지도 미리보기: `tools/preview/moon_map.png`) |
 | `tools/upload_p4.py` | 업로드(자원 포함) |
 | `tools/ha_bridge.py` | 선택: Home Assistant ↔ 패널 USB 브리지(엘리베이터·관리실·방문 호출) |
 

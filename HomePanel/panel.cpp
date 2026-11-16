@@ -15,7 +15,10 @@ static esp_ldo_channel_handle_t phyPower;
 static uint8_t touchAddress;
 static uint16_t touchWidth = SCREEN_W, touchHeight = SCREEN_H;
 
+// Refreshes still to wait for before the buffer that was on screen may be drawn into.
+static volatile int pendingRefresh = 0;
 static bool IRAM_ATTR onRefreshDone(esp_lcd_panel_handle_t, esp_lcd_dpi_panel_event_data_t*, void*) {
+  if (pendingRefresh > 0) pendingRefresh = pendingRefresh - 1;
   BaseType_t woken = pdFALSE;
   xSemaphoreGiveFromISR(refreshDone, &woken);
   return woken == pdTRUE;
@@ -74,12 +77,19 @@ const uint16_t* panelFrontBuffer() {
 }
 
 void panelPresent() {
-  xSemaphoreTake(refreshDone, 0);
   // Passing a driver frame buffer only writes back the cache and flips at vsync.
   ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(lcd, 0, 0, SCREEN_W, SCREEN_H, panelBackBuffer()));
+  // Counted from here (after the flip is recorded): refreshes during the cache write-back
+  // above must not count, or the old front buffer could be drawn into while still scanned.
+  xSemaphoreTake(refreshDone, 0);
+  pendingRefresh = 2;   // the old front buffer is free after two refreshes (latched flip + one scan)
   frontBuffer ^= 1;
-  // Wait until the old front buffer is no longer scanned before reusing it.
-  for (int i = 0; i < 2; ++i) xSemaphoreTake(refreshDone, pdMS_TO_TICKS(40));
+  // No wait here: the loop goes on (touch, serial); panelAcquireBack() waits if needed.
+}
+
+void panelAcquireBack() {
+  const uint32_t start = millis();
+  while (pendingRefresh > 0 && millis() - start < 80) xSemaphoreTake(refreshDone, pdMS_TO_TICKS(40));
 }
 
 void panelBrightness(uint8_t percent) {
@@ -118,22 +128,34 @@ bool touchBegin() {
   return false;
 }
 
-int touchRead(uint16_t& x, uint16_t& y) {
-  uint8_t status, point[8];
+int touchReadPoints(uint16_t* xs, uint16_t* ys, int max) {
+  if (max <= 0) return -1;
+  uint8_t status, points[8 * 5];
   if (!touchAddress || !readRegister(0x814E, &status, 1) || !(status & 0x80)) return -1;
-  uint8_t count = status & 0x0F;
-  bool ok = !count || (count <= 5 && readRegister(0x814F, point, 8));
+  const int count = status & 0x0F;
+  const int n = std::min(count, std::min(max, 5));
+  bool ok = !count || (count <= 5 && readRegister(0x814F, points, 8 * n));
   Wire.beginTransmission(touchAddress);
   Wire.write(uint8_t(0x81)); Wire.write(uint8_t(0x4E)); Wire.write(uint8_t(0));
   if (Wire.endTransmission() || !ok) return -1;
-  if (!count) return 0;
-  uint16_t rawX = point[1] | (uint16_t(point[2]) << 8);
-  uint16_t rawY = point[3] | (uint16_t(point[4]) << 8);
-  uint16_t rw = touchWidth, rh = touchHeight;
-  if (TOUCH_SWAP_XY) { std::swap(rawX, rawY); std::swap(rw, rh); }
-  x = min(uint32_t(SCREEN_W-1), uint32_t(rawX) * SCREEN_W / rw);
-  y = min(uint32_t(SCREEN_H-1), uint32_t(rawY) * SCREEN_H / rh);
-  if (TOUCH_MIRROR_X) x = SCREEN_W-1-x;
-  if (TOUCH_MIRROR_Y) y = SCREEN_H-1-y;
-  return 1;
+  for (int i = 0; i < n; ++i) {
+    const uint8_t* point = points + 8 * i;   // track id, x, y, size, reserved
+    uint16_t rawX = point[1] | (uint16_t(point[2]) << 8);
+    uint16_t rawY = point[3] | (uint16_t(point[4]) << 8);
+    uint16_t rw = touchWidth, rh = touchHeight;
+    if (TOUCH_SWAP_XY) { std::swap(rawX, rawY); std::swap(rw, rh); }
+    uint16_t x = min(uint32_t(SCREEN_W-1), uint32_t(rawX) * SCREEN_W / rw);
+    uint16_t y = min(uint32_t(SCREEN_H-1), uint32_t(rawY) * SCREEN_H / rh);
+    if (TOUCH_MIRROR_X) x = SCREEN_W-1-x;
+    if (TOUCH_MIRROR_Y) y = SCREEN_H-1-y;
+    xs[i] = x; ys[i] = y;
+  }
+  return n;
+}
+
+int touchRead(uint16_t& x, uint16_t& y) {
+  uint16_t xs[1], ys[1];
+  const int n = touchReadPoints(xs, ys, 1);
+  if (n > 0) { x = xs[0]; y = ys[0]; return 1; }
+  return n;
 }

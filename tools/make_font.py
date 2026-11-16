@@ -7,6 +7,7 @@ Run after changing any UI text:  py -3 tools/make_font.py
 """
 import math
 import re
+import numpy as np
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
@@ -21,7 +22,11 @@ FONTS = [
     ('BODY', 23, 500, 'ui'),
     ('TITLE', 30, 700, 'ui'),
     ('DISPLAY', 60, 600, DIGITS),
+    ('TEXT', 19, 400, 'all'),       # every Hangul syllable: typed addresses and search results
 ]
+# 'all': ASCII, the 11,172 Hangul syllables and the compatibility jamo (keyboard input)
+ALL = ''.join(chr(c) for c in range(32, 127)) + ''.join(chr(c) for c in range(0xAC00, 0xD7A4)) + \
+      ''.join(chr(c) for c in range(0x3131, 0x3164)) + '°·'
 
 
 def ui_chars():
@@ -41,7 +46,7 @@ def load(size, weight):
 def build(name, size, weight, charset):
     """Returns (height, glyphs [(code, advance, offset)], 4-bit bitmap rows padded to bytes)."""
     font = load(size, weight)
-    chars = ui_chars() if charset == 'ui' else sorted(set(charset))
+    chars = ui_chars() if charset == 'ui' else sorted(set(ALL if charset == 'all' else charset))
     # One tight line box per font: union of the ink of every glyph.
     top = min(font.getbbox(ch)[1] for ch in chars if ch.strip())
     bottom = max(font.getbbox(ch)[3] for ch in chars if ch.strip())
@@ -52,11 +57,10 @@ def build(name, size, weight, charset):
         image = Image.new('L', (advance, height))
         ImageDraw.Draw(image).text((0, -top), ch, font=font, fill=255)
         offset = len(bitmap)
-        for y in range(height):
-            row = [image.getpixel((x, y)) * 15 // 255 for x in range(advance)]
-            if len(row) % 2:
-                row.append(0)
-            bitmap.extend((row[i] << 4) | row[i+1] for i in range(0, len(row), 2))
+        px = (np.asarray(image, dtype=np.uint16) * 15 // 255).astype(np.uint8)
+        if advance % 2:
+            px = np.concatenate([px, np.zeros((height, 1), np.uint8)], axis=1)
+        bitmap.extend(((px[:, 0::2] << 4) | px[:, 1::2]).tobytes())
         glyphs.append((ord(ch), advance, offset))
     return height, glyphs, bytes(bitmap)
 

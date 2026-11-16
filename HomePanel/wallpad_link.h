@@ -34,7 +34,7 @@ constexpr int LIGHT_GROUPS = 8, OUTLETS = 8;
 // Gas valve controller. Its AB 41 reply (B0 41 01) did not change when the valve was opened
 // by hand on this home's bus, so the valve position is treated as unknown; only a
 // confirmed close command (B0 78) is recorded.
-struct GasState { bool seen; uint32_t at; uint32_t closedAt; };  // closedAt: millis() of the last confirmed close
+struct GasState { bool seen; uint32_t at; uint64_t closedAt; };  // closedAt: 64-bit ms since boot of the last confirmed close
 struct LightGroup { bool seen; uint8_t count; uint8_t bits; uint32_t at; }; // AC 79 -> B0 79 RN BM / GR TG
 struct OutletState { bool seen; uint8_t mode; uint16_t watts; uint32_t at; };  // C6 4A -> B0 4A GR XX WW WW ..
 struct VentState { bool seen; bool on; uint8_t speed; bool automatic; uint32_t at; };  // C2 4E -> B0 4E XX MM YY
@@ -46,7 +46,8 @@ struct IntercomState {
   bool seen;            // the wallpad talks to an intercom that answers
   IntercomPhase phase;
   uint8_t ringDoor;     // 1 home door, 2 common door (while ringing)
-  uint32_t at;
+  uint32_t at;          // last phase change
+  uint32_t seenAt;      // last reply from an intercom (for "seen" expiry)
 };
 // Entrance switch (AD old / CC new): events the wallpad confirms to it.
 struct EntranceState {
