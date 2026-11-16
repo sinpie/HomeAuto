@@ -25,6 +25,36 @@ enum WallpadLinkState : uint8_t {
   WALLPAD_CONNECTED,    // TCP connected (data may still be absent)
 };
 
+// Other wallpad devices (Samsung SDS packet formats, n-andflash/ha_addons DOCS_PACKETS).
+// A device reply (B0 ...) is read in the context of the wallpad query just before it.
+// "seen" = a reply arrived within the stale window; nothing is ever sent.
+constexpr int LIGHT_GROUPS = 8, OUTLETS = 8;
+
+struct GasState { bool seen; bool closed; uint32_t at; };                  // AB 41 -> B0 41 XX (01 closed)
+struct LightGroup { bool seen; uint8_t count; uint8_t bits; uint32_t at; }; // AC 79 -> B0 79 RN BM / GR TG
+struct OutletState { bool seen; uint8_t mode; uint16_t watts; uint32_t at; };  // C6 4A -> B0 4A GR XX WW WW ..
+struct VentState { bool seen; bool on; uint8_t speed; bool automatic; uint32_t at; };  // C2 4E -> B0 4E XX MM YY
+struct EnergyState { bool seen; uint32_t value; uint32_t at; };            // AA 6F YY -> B0 6F YY ZZ ZZ ZZ
+
+// Intercom (headers A1..A6): what the wallpad tells the intercoms.
+enum IntercomPhase : uint8_t { INTERCOM_IDLE, INTERCOM_RINGING, INTERCOM_CALL, INTERCOM_BUSY };
+struct IntercomState {
+  bool seen;            // the wallpad talks to an intercom that answers
+  IntercomPhase phase;
+  uint8_t ringDoor;     // 1 home door, 2 common door (while ringing)
+  uint32_t at;
+};
+// Entrance switch (AD old / CC new): events the wallpad confirms to it.
+struct EntranceState {
+  bool seen;            // an entrance switch answers
+  int8_t gasClosed;     // gas state pushed to the switch: -1 unknown, 0 open, 1 closed
+  int8_t away;          // away mode: -1 unknown, 0 released, 1 set
+  int8_t lightsAllOff;  // batch light switch: -1 unknown, 0 normal, 1 all off
+  uint32_t at;
+};
+// Wallpad clock pushed to the new entrance switch: CC 01 16 YY MM DD HH NN SS ..
+struct WallClock { bool valid; uint8_t year, month, day, hour, minute, second; uint32_t at; };
+
 struct WallpadSnapshot {
   WallpadLinkState state;
   bool wifi;            // true: WiFi, false: Ethernet
@@ -34,6 +64,21 @@ struct WallpadSnapshot {
   uint32_t badBytes;    // bytes that did not form a valid packet
   uint32_t lastPacketAt;
   HeatZone zones[HEAT_ZONES];
+  GasState gas;
+  LightGroup lights[LIGHT_GROUPS];
+  OutletState outlets[OUTLETS];
+  VentState vent;
+  EnergyState energy[3];     // 0 electricity (W), 1 gas, 2 water (meter digits, scale is home-specific)
+  // Doorbell rings sent by the wallpad to intercom devices (An 31 = home door, An 32 = common door).
+  uint32_t doorbells;        // increments once per ring
+  uint8_t lastDoorbell;      // 1 home door, 2 common door
+  uint32_t doorOpens;        // door opened during a call (An 3B GY confirmed by the wallpad)
+  uint8_t lastDoorOpen;      // 1 home door, 2 common door
+  IntercomState intercom;
+  EntranceState entrance;
+  uint32_t elevatorCalls;    // elevator call confirmed by the wallpad (AD 2F / CC 10)
+  uint32_t elevatorArrivals; // elevator arrived (CC 12)
+  WallClock clock;
 };
 
 // wifiSsid empty -> Ethernet. The password is only passed to the WiFi driver.

@@ -19,13 +19,21 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LENGTHS = (4, 5, 8, 6, 7, 9, 10, 11, 12)
+LENGTHS = (4, 5, 8, 6, 7, 9, 10, 11, 12, 23)
 
 # Meaning of headers / commands as described in public SDS wallpad analyses (unverified for this home).
 HEADERS = {0xAC: 'light', 0xAD: 'entrance switch', 0xAE: 'heating', 0xAB: 'gas', 0xAA: 'energy meter',
-           0xC2: 'ventilation', 0xC6: 'outlet', 0xCC: 'entrance switch (new)', 0xB0: 'device reply'}
+           0xC2: 'ventilation', 0xC6: 'outlet', 0xCC: 'entrance switch (new)', 0xCE: 'unknown (CE)',
+           0xC1: 'unknown (C1)', 0xC3: 'unknown (C3)', 0xB0: 'device reply',
+           **{h: f'intercom {h - 0xA0}' for h in range(0xA1, 0xA7)}}
 COMMANDS = {0x41: 'poll/keepalive', 0x5A: 'scan', 0x7C: 'heating status', 0x7D: 'heating on/off',
-            0x7F: 'heating set temp', 0x2F: 'elevator call', 0x10: 'elevator call (new)', 0x56: 'gas status'}
+            0x7F: 'heating set temp', 0x2F: 'elevator call', 0x10: 'elevator call (new)', 0x12: 'elevator arrived',
+            0x56: 'gas status', 0x78: 'gas close', 0x79: 'light status', 0x7A: 'light command', 0x4A: 'outlet status',
+            0x6E: 'outlet power', 0x4B: 'outlet standby cut', 0x4E: 'ventilation status', 0x4F: 'ventilation command',
+            0x6F: 'meter reading', 0x31: 'doorbell home door', 0x32: 'doorbell common door', 0x3E: 'bell off',
+            0x42: 'intercom busy', 0x35: 'video connected', 0x36: 'call accepted', 0x38: 'video call',
+            0x3B: 'door open', 0x01: 'clock push', 0x08: 'away mode', 0x0B: 'device states', 0x13: 'gas close (switch)',
+            0x52: 'batch light query', 0x54: 'batch light off', 0x55: 'gas close (switch)'}
 
 
 def checksum_ok(packet):

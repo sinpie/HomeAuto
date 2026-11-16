@@ -17,6 +17,8 @@ constexpr int PHY_ADDR = 1, PHY_MDC = 31, PHY_MDIO = 52, PHY_RESET = 51;
 constexpr uint32_t WIFI_RETRY_MS = 20000;   // re-issue WiFi.begin() while not associated
 constexpr uint32_t SILENT_RECONNECT_MS = 30000;  // the bus talks every ~0.8 s; silence = dead TCP
 constexpr uint32_t ZONE_STALE_MS = 15000;   // drop heating values not refreshed for this long
+constexpr uint32_t DEVICE_STALE_MS = 30000; // other devices: drop state not refreshed for this long
+constexpr uint32_t DOORBELL_REPEAT_MS = 15000;  // the same ring is repeated to every intercom header
 constexpr uint32_t RSSI_PERIOD_MS = 5000;   // RSSI is a request to the C6: keep it rare
 constexpr uint8_t REASON_ASSOC_LEAVE = 8;   // our own WiFi.disconnect()
 
@@ -35,6 +37,9 @@ uint32_t wifiStartedAt = 0;
 uint8_t buf[64];
 int len = 0;
 uint32_t packets = 0, badBytes = 0;
+// Last wallpad -> device packet: a device reply (B0 ..) is interpreted in its context.
+uint8_t queryHead = 0, queryCmd = 0, queryArg = 0;
+uint32_t lastRingAt[3] = {};
 
 void startWifi() {
   ownDisconnect = true;  // the reason-8 event this causes is not the failure we want to see
@@ -71,9 +76,18 @@ void expireZones() {
   const uint32_t now = millis();
   if(now - last < 1000) return;
   last = now;
+  auto stale = [now](bool& seen, uint32_t at, uint32_t limit) { if(seen && now - at > limit) seen = false; };
   portENTER_CRITICAL(&lock);
-  for(HeatZone& z : shared.zones)
-    if(z.seen && now - z.at > ZONE_STALE_MS) z.seen = false;
+  for(HeatZone& z : shared.zones) stale(z.seen, z.at, ZONE_STALE_MS);
+  stale(shared.gas.seen, shared.gas.at, DEVICE_STALE_MS);
+  for(LightGroup& l : shared.lights) stale(l.seen, l.at, DEVICE_STALE_MS);
+  for(OutletState& o : shared.outlets) stale(o.seen, o.at, DEVICE_STALE_MS);
+  stale(shared.vent.seen, shared.vent.at, DEVICE_STALE_MS);
+  for(EnergyState& e : shared.energy) stale(e.seen, e.at, DEVICE_STALE_MS);
+  stale(shared.intercom.seen, shared.intercom.at, DEVICE_STALE_MS);
+  stale(shared.entrance.seen, shared.entrance.at, DEVICE_STALE_MS);
+  // A ring or call that is no longer refreshed by the wallpad is over.
+  if(shared.intercom.phase != INTERCOM_IDLE && now - shared.intercom.at > 60000) shared.intercom.phase = INTERCOM_IDLE;
   portEXIT_CRITICAL(&lock);
 }
 
@@ -86,18 +100,163 @@ bool checksumOk(const uint8_t* p, int n) {
   return (x & 0x7F) == p[n-1];
 }
 
+uint32_t bcd3(const uint8_t* d) {
+  uint32_t v = 0;
+  for(int i=0; i<3; ++i) v = v*100 + (d[i]>>4)*10 + (d[i]&15);
+  return v;
+}
+
+bool isIntercom(uint8_t head) { return head >= 0xA1 && head <= 0xA6; }
+
+// Wallpad -> device packet. Records the query context and the events the wallpad
+// announces to intercoms and entrance switches.
+void wallpadPacket(const uint8_t* p, int n, uint32_t now) {
+  queryHead = p[0]; queryCmd = p[1]; queryArg = n > 2 ? p[2] : 0;
+  const uint8_t head = p[0], cmd = p[1];
+
+  if(isIntercom(head) && n == 4) {
+    IntercomState& ic = shared.intercom;
+    switch(cmd) {
+      case 0x31: case 0x32: {  // doorbell: 31 home door, 32 common door (repeated to every intercom)
+        const uint8_t door = cmd == 0x31 ? 1 : 2;
+        if(!lastRingAt[door] || now - lastRingAt[door] > DOORBELL_REPEAT_MS) {
+          ++shared.doorbells;
+          shared.lastDoorbell = door;
+        }
+        lastRingAt[door] = now;
+        ic.phase = INTERCOM_RINGING; ic.ringDoor = door; ic.at = now;
+        break;
+      }
+      case 0x3E: ic.phase = INTERCOM_IDLE; ic.at = now; break;                         // bell off
+      case 0x42: if(ic.phase != INTERCOM_CALL) { ic.phase = INTERCOM_BUSY; ic.at = now; } break;  // other intercom busy
+      case 0x35: case 0x36: case 0x38: ic.phase = INTERCOM_CALL; ic.at = now; break;   // video / accepted / video call
+      case 0x3B:                                                                        // door opened (GY 00 home, 01 common)
+        ++shared.doorOpens;
+        shared.lastDoorOpen = p[2] == 0 ? 1 : 2;
+        break;
+    }
+    return;
+  }
+
+  EntranceState& en = shared.entrance;
+  if(head == 0xAD) {  // old entrance switch
+    if(cmd == 0x56 && n == 4 && p[2] <= 1) en.gasClosed = p[2];           // gas state pushed to the switch
+    else if(cmd == 0x55 && n == 4) en.gasClosed = 1;                       // gas close confirmed
+    else if(cmd == 0x2F && n == 4) ++shared.elevatorCalls;                 // elevator call confirmed
+    else if(cmd == 0x54 && n == 4) en.lightsAllOff = p[2] == 0;            // batch light switch confirmed
+    return;
+  }
+  if(head == 0xCC) {  // new entrance switch
+    if(cmd == 0x01 && n >= 10 && p[2] == 0x16) {                           // clock push: YY MM DD HH NN SS
+      if(p[4] >= 1 && p[4] <= 12 && p[5] >= 1 && p[5] <= 31 && p[6] < 24 && p[7] < 60 && p[8] < 60)
+        shared.clock = {true, p[3], p[4], p[5], p[6], p[7], p[8], now};
+    }
+    else if(cmd == 0x0B && n >= 5 && p[3] <= 1) en.gasClosed = p[3] == 0 ? 1 : 0;  // CC 0B 04 YY: 00 closed
+    else if(cmd == 0x12) ++shared.elevatorArrivals;                        // elevator arrived
+    else if(cmd == 0x10) ++shared.elevatorCalls;                           // elevator call confirmed
+    else if(cmd == 0x08 && n >= 5 && p[3] <= 1) en.away = p[3] == 0;       // away mode: 00 set, 01 released
+    else if(cmd == 0x13 || cmd == 0x02) en.gasClosed = 1;                  // gas close confirmed
+  }
+}
+
+// Device -> wallpad reply (B0 ..), read in the context of the preceding query.
+void deviceReply(const uint8_t* p, int n, uint32_t now) {
+  // Heating: B0 7C|7D|7F GR TG SET CUR FF PT (carries its own group id)
+  if(n==8 && (p[1]==0x7C || p[1]==0x7D || p[1]==0x7F) && p[2]>=1 && p[2]<=HEAT_ZONES && p[3]<=1) {
+    HeatZone& z = shared.zones[p[2]-1];
+    z.seen = true; z.on = p[3]==1; z.set = p[4]; z.current = p[5]; z.at = now;
+    return;
+  }
+  if(isIntercom(queryHead)) {  // an intercom answers
+    IntercomState& ic = shared.intercom;
+    ic.seen = true;
+    if(p[1] == 0x42 || p[1] == 0x36) { ic.phase = INTERCOM_CALL; ic.at = now; }
+    else if(ic.at == 0) ic.at = now;
+    return;
+  }
+  switch(queryHead) {
+    case 0xAD: case 0xCC: {  // an entrance switch answers
+      EntranceState& en = shared.entrance;
+      en.seen = true; en.at = now;
+      if(queryHead == 0xAD && queryCmd == 0x52 && p[1] == 0x52 && n == 4) en.lightsAllOff = p[2] == 0;
+      break;
+    }
+    case 0xAB:  // gas valve: AB 41 00 -> B0 41 XX (00 open, 01 closed); AB 78 (close) -> B0 78
+      if(n==4 && queryCmd==0x41 && p[1]==0x41 && p[2]<=1) shared.gas = {true, p[2]==1, now};
+      else if(n==4 && queryCmd==0x78 && p[1]==0x78) shared.gas = {true, true, now};
+      break;
+    case 0xAC:  // lights
+      if(n==5 && queryCmd==0x79 && p[1]==0x79) {
+        // AC 79 00 GR -> B0 79 RN BM (RN = count<<4 | room); older: AC 79 GR 00 -> B0 79 GR TG
+        int index; uint8_t count, bits;
+        if(queryArg == 0) { index = (p[2] & 15) - 1; count = p[2] >> 4; bits = p[3]; }
+        else { index = p[2] - 1; count = 1; bits = p[3] ? 1 : 0; }
+        if(index >= 0 && index < LIGHT_GROUPS && count >= 1 && count <= 8) shared.lights[index] = {true, count, bits, now};
+      } else if(n==5 && queryCmd==0x7A && (p[1]==0x79 || p[1]==0x7A)) {
+        // reply to a light command AC 7A GR TG: GR 00 = all lights
+        if(p[2] == 0 && p[3] == 0) {
+          for(LightGroup& l : shared.lights) if(l.seen) { l.bits = 0; l.at = now; }
+        } else if(p[2] >= 1 && p[2] <= LIGHT_GROUPS) {
+          LightGroup& l = shared.lights[p[2]-1];
+          if(!l.seen || l.count == 1) l = {true, 1, uint8_t(p[3] ? 1 : 0), now};
+        }
+      }
+      break;
+    case 0xC6:  // outlets: C6 4A GR .. -> B0 4A GR XX WW WW 00 ZZ 00 PT (XX 01 on, 11 standby-cut armed, 10 cut)
+      if(n==10 && p[2]>=1 && p[2]<=OUTLETS) {
+        OutletState& o = shared.outlets[p[2]-1];
+        if(queryCmd==0x4A && p[1]==0x4A) o = {true, p[3], uint16_t(p[4]<<8 | p[5]), now};
+        else if(queryCmd==0x6E && p[1]==0x6E && o.seen) { o.mode = p[3] ? 0x01 : 0x10; o.at = now; }    // power on/off
+        else if(queryCmd==0x4B && p[1]==0x4B && o.seen) { o.mode = p[3] ? 0x11 : 0x01; o.at = now; }    // standby cut
+      }
+      break;
+    case 0xC2:  // ventilation
+      if(n==6 && queryCmd==0x4E && p[1]==0x4E && p[2]<=3) {
+        // B0 4E XX MM YY: XX 03/02/01 = speed 1/2/3, 00 off; MM 01 auto/night; YY 00 = on
+        const uint8_t speed = p[2] ? uint8_t(4 - p[2]) : 0;
+        shared.vent = {true, p[4]==0, speed, p[3]==1, now};
+      } else if(n==6 && queryCmd==0x4F && p[1]==0x4F && shared.vent.seen) {
+        // command reply B0 4F ZZ: 06 off, 05 on, 04 auto, 03/02/01 speed 1/2/3
+        VentState& v = shared.vent;
+        switch(p[2]) {
+          case 0x06: v.on = false; break;
+          case 0x05: v.on = true; break;
+          case 0x04: v.on = true; v.automatic = true; break;
+          case 0x01: case 0x02: case 0x03: v.on = true; v.automatic = false; v.speed = uint8_t(4 - p[2]); break;
+        }
+        v.at = now;
+      }
+      break;
+    case 0xAA:  // energy meter: AA 6F YY -> B0 6F YY ZZ ZZ ZZ (decimal digits; 00 power W, 01 gas, 02 water)
+      if(n==7 && queryCmd==0x6F && p[1]==0x6F && p[2]<=2) shared.energy[p[2]] = {true, bcd3(p+3), now};
+      break;
+  }
+}
+
 void handlePacket(const uint8_t* p, int n) {
   const uint32_t now = millis();
   portENTER_CRITICAL(&lock);
   ++packets;
   shared.packets = packets;
   shared.lastPacketAt = now;
-  // Heating reply to status / on-off / set-temperature: B0 7C|7D|7F GR TG SET CUR FF PT
-  if(n==8 && p[0]==0xB0 && (p[1]==0x7C || p[1]==0x7D || p[1]==0x7F) && p[2]>=1 && p[2]<=HEAT_ZONES && p[3]<=1) {
-    HeatZone& z = shared.zones[p[2]-1];
-    z.seen = true; z.on = p[3]==1; z.set = p[4]; z.current = p[5]; z.at = now;
-  }
+  if(p[0] == 0xB0) deviceReply(p, n, now); else wallpadPacket(p, n, now);
   portEXIT_CRITICAL(&lock);
+}
+
+// Packet length expected from context (outlet packets are 10 bytes, fan 6, meter 7).
+int expectedLength() {
+  if(len < 2) return 0;
+  const uint8_t head = buf[0], cmd = buf[1];
+  if(head == 0xC6 && (cmd == 0x4A || cmd == 0x4B || cmd == 0x6E)) return 10;
+  if(head == 0xC2 && (cmd == 0x4E || cmd == 0x4F)) return 6;
+  if(head == 0xAA && cmd == 0x6F) return 4;
+  if(head == 0xCC && cmd == 0x01) return 23;      // clock push: CC 01 16 YY MM DD HH NN SS U1 00x15... PT
+  if(head == 0xB0) {
+    if(queryHead == 0xC6 && (cmd == 0x4A || cmd == 0x4B || cmd == 0x6E)) return 10;
+    if(queryHead == 0xC2 && (cmd == 0x4E || cmd == 0x4F)) return 6;
+    if(queryHead == 0xAA && cmd == 0x6F) return 7;
+  }
+  return 0;
 }
 
 void drop(int n) {
@@ -114,26 +273,31 @@ void countBad(int n) {
 
 // Split the byte stream. A packet is accepted when its checksum is valid and the
 // next byte starts a new packet (or the line went idle, see flushIdle()).
+const int LENGTHS[] = {4, 5, 8, 6, 7, 9, 10};
+
 void parse() {
-  static const int lengths[] = {4, 5, 8, 6, 7};
   while(len > 0) {
     if(buf[0] < 0x80) { drop(1); countBad(1); continue; }
+    const int hint = expectedLength();
+    if(hint && len < hint+1) return;  // wait: a shorter prefix could pass the checksum by chance
+    if(hint && buf[hint] >= 0x80 && checksumOk(buf, hint)) { handlePacket(buf, hint); drop(hint); continue; }
     bool found = false;
-    for(int L : lengths) {
+    for(int L : LENGTHS) {
       if(len >= L+1 && buf[L] >= 0x80 && checksumOk(buf, L)) { handlePacket(buf, L); drop(L); found = true; break; }
     }
     if(found) continue;
-    if(len >= 13) { drop(1); countBad(1); continue; }
+    if(len >= (hint > 12 ? hint + 1 : 13)) { drop(1); countBad(1); continue; }
     return;  // wait for more bytes
   }
 }
 
 // The last packet of a burst has no following header byte; accept it on idle.
 void flushIdle() {
-  static const int lengths[] = {4, 5, 8, 6, 7};
-  for(int L : lengths)
+  const int hint = expectedLength();
+  if(hint && len == hint && buf[0] >= 0x80 && checksumOk(buf, hint)) { handlePacket(buf, hint); len = 0; return; }
+  for(int L : LENGTHS)
     if(len == L && buf[0] >= 0x80 && checksumOk(buf, L)) { handlePacket(buf, L); len = 0; return; }
-  if(len >= 13) { countBad(len); len = 0; }
+  if(len >= 24) { countBad(len); len = 0; }
 }
 
 void feed(uint8_t b) {
@@ -192,6 +356,7 @@ void wallpadBegin(const char* host, uint16_t port, const char* ssid, const char*
   targetHost = host;
   targetPort = port;
   useWifi = ssid && *ssid;
+  shared.entrance.gasClosed = shared.entrance.away = shared.entrance.lightsAllOff = -1;  // unknown until announced
   if(!host || !*host) { setState(WALLPAD_NOT_CONFIGURED, 0); return; }
   if(useWifi) {
     // WiFi runs on the ESP32-C6 coprocessor (ESP-Hosted).

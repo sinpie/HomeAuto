@@ -20,17 +20,17 @@ uint16_t* background;  // PSRAM copy of BG_IMAGE (faster than reading flash ever
 constexpr uint32_t REPLY_TIMEOUT_MS = 6000, NOTICE_MS = 4000, RING_SHOW_MS = 60000;
 constexpr int DEMO_HOME_FLOOR = 12;
 
-enum Page { HOME, BOILER, CALLS, SETTINGS, PAGE_COUNT };
-const char* pageNames[] = {"홈", "보일러", "방문 호출", "설정"};
-const IconId pageIcons[] = {ICON_HOME, ICON_FLAME, ICON_BELL, ICON_GEAR};
+enum Page { HOME, BOILER, CONTROL, CALLS, SETTINGS, PAGE_COUNT };
+const char* pageNames[] = {"홈", "보일러", "제어", "방문 호출", "설정"};
+const IconId pageIcons[] = {ICON_HOME, ICON_FLAME, ICON_POWER, ICON_BELL, ICON_GEAR};
 const char* doorNames[] = {"현관", "1층 현관", "지하주차장 문"};
 const IconId doorIcons[] = {ICON_DOOR, ICON_BUILDING, ICON_PARKING};
 
 struct Elevator { int floor=0, dir=0; bool calling=false, pending=false; uint32_t requestedAt=0, arrivedAt=0, failedAt=0; } elev;
-// Heating rooms = wallpad heating groups 1..ROOM_COUNT. Group 1 is the living room
-// (confirmed by a set-temperature sweep); the other names are placeholders.
+// Heating rooms = wallpad heating groups 1..ROOM_COUNT (confirmed on this home's bus:
+// group 1 living room by a set-temperature sweep; groups 2-4 named by the owner).
 constexpr int ROOM_COUNT = 4;
-const char* roomNames[ROOM_COUNT] = {"거실", "방 2", "방 3", "방 4"};
+const char* roomNames[ROOM_COUNT] = {"거실", "안방", "방1", "방2"};
 constexpr uint32_t ZONE_STALE_MS = 15000;
 struct RoomView { bool known, on; int set, current; };
 RoomView rooms[ROOM_COUNT];
@@ -38,6 +38,10 @@ WallpadSnapshot wallpad = {};
 uint32_t roomSignature = 0, lastWallpadPoll = 0;
 bool wallpadLive();
 const char* wallpadStatusText();
+const WallpadSnapshot& devices();
+int navPages(int* out);
+bool controlVisible();
+uint32_t deviceSignature();
 struct Office { bool calling=false, pending=false; uint32_t requestedAt=0, startedAt=0, failedAt=0; } office;
 struct Ring { uint8_t door; uint64_t at; };
 Ring rings[8];
@@ -118,16 +122,25 @@ void drawSidebar() {
   circle(46, 52, 22, ACCENT);
   iconCenter(ICON_HOME, S24, 46, 51, ON_ACCENT);
   text(80, 34, "우리집", TEXT, FONT_TITLE);
-  for(int i=0; i<PAGE_COUNT; ++i) {
-    const int y = 112 + i*66;
+  int nav[PAGE_COUNT];
+  const int count = navPages(nav);
+  for(int k=0; k<count; ++k) {
+    const int i = nav[k], y = 112 + k*66;
     const bool on = page==i;
     if(on) { shape(24, y, 160, 54, 16, WHITE, 30); shape(24, y+15, 4, 24, 2, ACCENT); }
     icon(pageIcons[i], S24, 42, y+15, on ? ACCENT : FAINT);
     text(78, y+(54-FONT_BODY.height)/2, pageNames[i], on ? TEXT : MUTED);
+    if(i==CALLS && ringCount && page!=CALLS) circle(168, y+27, 5, WARN);  // unseen call history
   }
-  if(ringCount && page!=CALLS && rings[0].at > 0) circle(168, 112+CALLS*66+27, 5, WARN);
-  char up[32]; const unsigned long m = millis()/60000;
-  if(m<60) snprintf(up, sizeof(up), "가동 %lu분", m); else snprintf(up, sizeof(up), "가동 %lu시간", m/60);
+  char up[40];
+  const WallClock& c = devices().clock;
+  if(c.valid) {  // wallpad time (pushed to the entrance switch), advanced locally
+    const uint32_t daySec = (uint32_t(c.hour)*3600 + c.minute*60 + c.second + (millis()-c.at)/1000) % 86400;
+    snprintf(up, sizeof(up), "%u월 %u일 %02lu:%02lu", c.month, c.day, (unsigned long)(daySec/3600), (unsigned long)(daySec/60%60));
+  } else {
+    const unsigned long m = millis()/60000;
+    if(m<60) snprintf(up, sizeof(up), "가동 %lu분", m); else snprintf(up, sizeof(up), "가동 %lu시간", m/60);
+  }
   text(36, 548, up, FAINT, FONT_CAPTION);
 }
 
@@ -177,8 +190,65 @@ void refreshRooms() {
     sig = sig*131 + rooms[i].current;
   }
   sig = sig*131 + wallpad.state;
+  sig = sig*131 + deviceSignature();
+  if(page == CONTROL && !controlVisible()) page = HOME;
   if(sig != roomSignature) { roomSignature = sig; dirty = true; }
 }
+// Devices other than heating: the live snapshot, or a fixed sample in demo mode.
+const WallpadSnapshot& devices() {
+  static WallpadSnapshot sample = [] {
+    WallpadSnapshot d = {};
+    d.gas = {true, true, 1};
+    d.lights[0] = {true, 3, 0b011, 1};
+    d.lights[1] = {true, 2, 0b00, 1};
+    d.outlets[0] = {true, 0x01, 85, 1};
+    d.outlets[1] = {true, 0x11, 3, 1};
+    d.vent = {true, true, 2, false, 1};
+    d.energy[0] = {true, 1234, 1};
+    d.energy[1] = {true, 1250, 1};
+    d.energy[2] = {true, 456, 1};
+    d.entrance = {true, 1, 0, 0, 1};
+    return d;
+  }();
+  return demo ? sample : wallpad;
+}
+enum CardKind : uint8_t { CARD_GAS, CARD_LIGHT, CARD_VENT, CARD_OUTLET, CARD_METER, CARD_ENTRANCE };
+struct ControlCard { CardKind kind; uint8_t index; };
+constexpr int MAX_CARDS = 1 + LIGHT_GROUPS + 1 + OUTLETS + 3 + 1;
+// One card per device, in display order; a card exists only while its device answers.
+int controlCards(ControlCard* out) {
+  const WallpadSnapshot& d = devices();
+  int n = 0;
+  if(d.gas.seen) out[n++] = {CARD_GAS, 0};
+  for(int i=0; i<LIGHT_GROUPS; ++i) if(d.lights[i].seen) out[n++] = {CARD_LIGHT, uint8_t(i)};
+  if(d.vent.seen) out[n++] = {CARD_VENT, 0};
+  for(int i=0; i<OUTLETS; ++i) if(d.outlets[i].seen) out[n++] = {CARD_OUTLET, uint8_t(i)};
+  for(int i=0; i<3; ++i) if(d.energy[i].seen) out[n++] = {CARD_METER, uint8_t(i)};
+  if(d.entrance.seen) out[n++] = {CARD_ENTRANCE, 0};
+  return n;
+}
+bool controlVisible() { ControlCard c[MAX_CARDS]; return controlCards(c) > 0; }
+// Sidebar entries: the control tab is listed only while some device answers.
+int navPages(int* out) {
+  int n = 0;
+  for(int i=0; i<PAGE_COUNT; ++i) if(i != CONTROL || controlVisible()) out[n++] = i;
+  return n;
+}
+uint32_t deviceSignature() {
+  const WallpadSnapshot& d = devices();
+  uint32_t sig = 7;
+  auto mix = [&](uint32_t v) { sig = sig*131 + v; };
+  mix(d.gas.seen); mix(d.gas.closed);
+  for(const LightGroup& l : d.lights) { mix(l.seen); mix(l.count); mix(l.bits); }
+  for(const OutletState& o : d.outlets) { mix(o.seen); mix(o.mode); mix(o.watts); }
+  mix(d.vent.seen); mix(d.vent.on); mix(d.vent.speed); mix(d.vent.automatic);
+  for(const EnergyState& e : d.energy) { mix(e.seen); mix(e.value); }
+  mix(d.entrance.seen); mix(uint8_t(d.entrance.gasClosed)); mix(uint8_t(d.entrance.away)); mix(uint8_t(d.entrance.lightsAllOff));
+  mix(d.intercom.seen); mix(d.intercom.phase);
+  mix(d.clock.valid ? d.clock.minute : 99);
+  return sig;
+}
+
 bool wallpadLive() { return !demo && wallpad.state==WALLPAD_CONNECTED && wallpad.lastPacketAt && millis()-wallpad.lastPacketAt < 5000; }
 const char* wallpadStatusText() {
   if(demo) return "체험 모드";
@@ -284,11 +354,115 @@ void drawBoiler() {
   text(224, 548, note, demo ? WARN : FAINT, FONT_CAPTION);
 }
 
+// Control cards: all the same size (smaller than the boiler cards), 3 x 3 grid.
+constexpr int CARD_W = 249, CARD_H = 124, CARD_GAP = 14, CARD_COLS = 3, CARD_ROWS = 3;
+
+void controlCard(int x,int y,const ControlCard& card) {
+  const WallpadSnapshot& d = devices();
+  glass(x, y, CARD_W, CARD_H, 22);
+  char title[24], status[32], detail[40] = "";
+  IconId glyph = ICON_POWER;
+  bool active = false;
+  uint16_t statusColor = MUTED;
+  int dots = 0; uint8_t dotBits = 0;
+  switch(card.kind) {
+    case CARD_GAS:
+      glyph = ICON_FLAME;
+      snprintf(title, sizeof(title), "가스 밸브");
+      snprintf(status, sizeof(status), "%s", d.gas.closed ? "잠김" : "열림");
+      snprintf(detail, sizeof(detail), "원격은 잠그기만 가능");
+      statusColor = d.gas.closed ? ACCENT : WARN;
+      active = !d.gas.closed;
+      break;
+    case CARD_LIGHT: {
+      const LightGroup& g = d.lights[card.index];
+      glyph = ICON_SUN;
+      snprintf(title, sizeof(title), "조명 %d", card.index + 1);
+      const int on = __builtin_popcount(g.bits & ((1u << g.count) - 1));
+      if(on) snprintf(status, sizeof(status), "%d/%d 켜짐", on, g.count); else snprintf(status, sizeof(status), "꺼짐");
+      active = on > 0;
+      statusColor = active ? HEAT : MUTED;
+      dots = g.count; dotBits = g.bits;
+      break;
+    }
+    case CARD_VENT:
+      glyph = ICON_GEAR;
+      snprintf(title, sizeof(title), "환기");
+      if(!d.vent.on) snprintf(status, sizeof(status), "꺼짐");
+      else if(d.vent.automatic) snprintf(status, sizeof(status), "자동");
+      else snprintf(status, sizeof(status), "%u단", d.vent.speed);
+      snprintf(detail, sizeof(detail), "%s", d.vent.automatic ? "자동·취침 모드" : "수동 모드");
+      active = d.vent.on;
+      statusColor = active ? HEAT : MUTED;
+      break;
+    case CARD_OUTLET: {
+      const OutletState& o = d.outlets[card.index];
+      snprintf(title, sizeof(title), "콘센트 %d", card.index + 1);
+      snprintf(status, sizeof(status), "%s", o.mode == 0x10 ? "차단됨" : (o.mode == 0x11 ? "대기전력 차단" : "켜짐"));
+      snprintf(detail, sizeof(detail), "%uW 사용 중", o.watts);
+      active = o.mode != 0x10;
+      statusColor = active ? HEAT : MUTED;
+      break;
+    }
+    case CARD_METER: {
+      static const char* names[3] = {"전기", "가스", "수도"};
+      const EnergyState& e = d.energy[card.index];
+      glyph = ICON_BUILDING;
+      snprintf(title, sizeof(title), "%s 사용량", names[card.index]);
+      if(card.index == 0) snprintf(status, sizeof(status), "%luW", (unsigned long)e.value);
+      else snprintf(status, sizeof(status), "%lu.%02lu", (unsigned long)(e.value/100), (unsigned long)(e.value%100));
+      snprintf(detail, sizeof(detail), "에너지 미터");
+      statusColor = TEXT;
+      break;
+    }
+    case CARD_ENTRANCE: {
+      const EntranceState& en = d.entrance;
+      glyph = ICON_DOOR;
+      snprintf(title, sizeof(title), "현관 스위치");
+      snprintf(status, sizeof(status), "%s", en.away == 1 ? "외출 설정" : (en.away == 0 ? "외출 해제" : "연결됨"));
+      snprintf(detail, sizeof(detail), "가스 %s · 일괄소등 %s",
+               en.gasClosed < 0 ? "-" : (en.gasClosed ? "잠김" : "열림"),
+               en.lightsAllOff < 0 ? "-" : (en.lightsAllOff ? "켜짐" : "꺼짐"));
+      active = en.away == 1;
+      statusColor = active ? HEAT : MUTED;
+      break;
+    }
+  }
+  const uint16_t chipFill = card.kind == CARD_GAS ? statusColor : HEAT;
+  iconChip(x+16, y+16, glyph, active ? chipFill : WHITE, active ? 256 : 30, active ? ON_HEAT : TEXT);
+  text(x+80, y+16, title, TEXT);
+  text(x+80, y+44, status, statusColor, FONT_CAPTION);
+  if(dots) {  // one dot per switch in the light group
+    for(int b=0; b<dots; ++b) {
+      const int cx = x + 26 + b*22, cy = y + 98;
+      if(dotBits & (1u << b)) circle(cx, cy, 7, HEAT); else shape(cx-7, cy-7, 14, 14, 7, MUTED, 200, 1.5f);
+    }
+  } else if(*detail) text(x+18, y+86, detail, FAINT, FONT_CAPTION);
+}
+
+void drawControl() {
+  ControlCard cards[MAX_CARDS];
+  const int n = controlCards(cards);
+  const int shown = std::min(n, CARD_COLS * CARD_ROWS);
+  for(int i=0; i<shown; ++i)
+    controlCard(224 + (i % CARD_COLS)*(CARD_W + CARD_GAP), 126 + (i / CARD_COLS)*(CARD_H + CARD_GAP), cards[i]);
+  char note[96];
+  if(demo) snprintf(note, sizeof(note), "체험 모드: 예시 값입니다");
+  else if(n > shown) snprintf(note, sizeof(note), "장치 %d개 중 %d개 표시 · 조작 기능은 아직 꺼져 있습니다", n, shown);
+  else snprintf(note, sizeof(note), "월패드 버스에서 읽은 상태 · 조작 기능은 아직 꺼져 있습니다");
+  text(224, 548, note, demo ? WARN : FAINT, FONT_CAPTION);
+}
+
 void drawCalls() {
   glass(224, 126, 776, 406, 26);
   icon(ICON_BELL, S24, 256, 150, MUTED);
   text(290, 148, "출입문 호출 기록", TEXT);
-  rightText(968, 150, "일방 호출 · 최근 5건", FAINT, FONT_CAPTION);
+  const IntercomState& ic = devices().intercom;
+  const char* phase = "일방 호출 · 최근 5건";
+  if(ic.phase == INTERCOM_RINGING) phase = ic.ringDoor == 1 ? "현관 벨 울리는 중" : "공동현관 벨 울리는 중";
+  else if(ic.phase == INTERCOM_CALL) phase = "인터폰 통화 중";
+  else if(ic.phase == INTERCOM_BUSY) phase = "다른 인터폰 사용 중";
+  rightText(968, 150, phase, ic.phase == INTERCOM_IDLE ? FAINT : WARN, FONT_CAPTION);
   if(!ringCount) { centerText(224, 314, 776, "호출 기록이 없습니다", FAINT); return; }
   for(int i=0; i<std::min(ringCount,5); ++i) {
     const int y = 192 + i*66;
@@ -360,6 +534,7 @@ void render() {
   drawElevator();
   if(page==HOME) drawHome();
   else if(page==BOILER) drawBoiler();
+  else if(page==CONTROL) drawControl();
   else if(page==CALLS) drawCalls();
   else drawSettings();
   if(activeRing>=0) drawRingOverlay();
@@ -377,7 +552,12 @@ void tap(int x,int y) {
   dirty = true;
   if(activeRing>=0) { if(inside(x,y,382,412,260,68)) { flash(382,412,260,68); dismissRing(); } return; }
   if(inside(x,y,868,28,118,66)) { flash(868,28,118,66); callElevator(); return; }
-  if(x<196 && y>=112 && y<112+PAGE_COUNT*66) { page = (y-112)/66; return; }
+  if(x<196 && y>=112) {
+    int nav[PAGE_COUNT];
+    const int count = navPages(nav), k = (y-112)/66;
+    if(k < count) page = nav[k];
+    return;
+  }
   if(page==HOME) {
     if(inside(x,y,224,126,384,206)) page = BOILER;
     else if(inside(x,y,648,248,328,60)) { flash(648,248,328,60); callOffice(); }
@@ -415,6 +595,19 @@ void serialLine(const String& line) {
   if(line=="SHOT") { sendScreenshot(); return; }
   if(line=="NET") { wallpadDiagnose(Serial, WIFI_SSID, false); return; }
   if(line=="NET SCAN") { wallpadDiagnose(Serial, WIFI_SSID, true); return; }
+  if(line=="DEV") {
+    const WallpadSnapshot w = wallpadSnapshot();
+    Serial.printf("DEV|gas|%d|%d\n", w.gas.seen, w.gas.closed);
+    for(int i=0; i<LIGHT_GROUPS; ++i) if(w.lights[i].seen) Serial.printf("DEV|light|%d|%u|%02X\n", i+1, w.lights[i].count, w.lights[i].bits);
+    for(int i=0; i<OUTLETS; ++i) if(w.outlets[i].seen) Serial.printf("DEV|outlet|%d|%02X|%u\n", i+1, w.outlets[i].mode, w.outlets[i].watts);
+    Serial.printf("DEV|vent|%d|%d|%u|%d\n", w.vent.seen, w.vent.on, w.vent.speed, w.vent.automatic);
+    for(int i=0; i<3; ++i) if(w.energy[i].seen) Serial.printf("DEV|energy|%d|%lu\n", i, (unsigned long)w.energy[i].value);
+    Serial.printf("DEV|intercom|%d|%d|bells|%lu|opens|%lu\n", w.intercom.seen, w.intercom.phase, (unsigned long)w.doorbells, (unsigned long)w.doorOpens);
+    Serial.printf("DEV|entrance|%d|gas|%d|away|%d|alloff|%d\n", w.entrance.seen, w.entrance.gasClosed, w.entrance.away, w.entrance.lightsAllOff);
+    Serial.printf("DEV|elevator|calls|%lu|arrivals|%lu|clock|%d\n", (unsigned long)w.elevatorCalls, (unsigned long)w.elevatorArrivals, w.clock.valid);
+    Serial.println("DEV|done");
+    return;
+  }
   if(line=="ASSETS") { Serial.printf("ASSETS|%s\n", assetsError()); return; }
   if(sscanf(l, "TAP|%d|%d%c", &a, &b, &extra)==2) { tap(a, b); return; }
   if(demo) return;
@@ -492,6 +685,15 @@ void loop() {
   if(millis()-lastWallpadPoll > 250) {
     lastWallpadPoll = millis();
     wallpad = wallpadSnapshot();
+    static uint32_t seenBells = 0, seenOpens = 0, seenCalls = 0, seenArrivals = 0;
+    if(!demo) {
+      if(wallpad.doorbells != seenBells) addRing(wallpad.lastDoorbell == 1 ? 0 : 1);  // home door / common door
+      if(wallpad.elevatorCalls != seenCalls) { elev.calling = true; elev.pending = false; dirty = true; }
+      if(wallpad.elevatorArrivals != seenArrivals) { elev.calling = false; elev.dir = 0; elev.arrivedAt = millis(); dirty = true; }
+      if(wallpad.doorOpens != seenOpens) dirty = true;
+    }
+    seenBells = wallpad.doorbells; seenOpens = wallpad.doorOpens;
+    seenCalls = wallpad.elevatorCalls; seenArrivals = wallpad.elevatorArrivals;
     refreshRooms();
     static uint32_t shownPackets = 0;  // settings page shows a live packet counter
     if(page==SETTINGS && wallpad.packets/10 != shownPackets/10) { shownPackets = wallpad.packets; dirty = true; }
