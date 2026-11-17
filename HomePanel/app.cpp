@@ -719,41 +719,53 @@ void formatClock(char* out, size_t n, time_t utc) {
   struct tm t; localtime_r(&utc, &t);
   snprintf(out, n, "%02d:%02d", t.tm_hour, t.tm_min);
 }
-const SkyDay& skyPaths(time_t t, float lat, float lon);
-// Rise/set for the local day of t (from the day's sky, see skyPaths).
-void riseSetFor(bool moon, time_t t, float lat, float lon, time_t& rise, time_t& set) {
-  const SkyDay& d = skyPaths(t, lat, lon);
-  rise = moon ? d.moonRise : d.sunRise;
-  set = moon ? d.moonSet : d.sunSet;
-}
-void riseSetRow(int x, int y, time_t rise, time_t set, uint16_t riseC, uint16_t setC) {
-  char t[8];
-  icon(ICON_SUNRISE, S24, x, y, riseC);
-  formatClock(t, sizeof(t), rise); text(x + 28, y, t, TEXT, FONT_CAPTION);
-  icon(ICON_SUNSET, S24, x + 82, y, setC);
-  formatClock(t, sizeof(t), set); text(x + 110, y, t, TEXT, FONT_CAPTION);
+// Rise and set times; `ref` is the shown time: a time on another day gets "+1" / "-1".
+// The row is moved left when the marks would pass `right`.
+void riseSetRow(int x, int y, time_t rise, time_t set, uint16_t riseC, uint16_t setC, time_t ref = 0, int right = SCREEN_W) {
+  char tr[8], ts[8], mr[8] = "", ms[8] = "";
+  formatClock(tr, sizeof(tr), rise); formatClock(ts, sizeof(ts), set);
+  auto mark = [&](time_t when, char* out) {
+    if(!when || !ref) return;
+    const long days = long((localMidnight(when) - localMidnight(ref)) / 86400);
+    if(days) snprintf(out, 8, "%+ld", days);
+  };
+  mark(rise, mr); mark(set, ms);
+  auto width = [&](const char* t, const char* m) { return 26 + textWidth(t, FONT_CAPTION) + (*m ? 2 + textWidth(m, FONT_CAPTION) : 0); };
+  const int w1 = width(tr, mr), gap = 8;
+  const int second = std::max(78, w1 + gap);
+  const int total = second + width(ts, ms);
+  if(x + total > right) x = right - total;
+  auto one = [&](int ix, IconId id, uint16_t c, const char* t, const char* m) {
+    icon(id, S24, ix, y, c);
+    text(ix + 26, y, t, TEXT, FONT_CAPTION);
+    if(*m) text(ix + 26 + textWidth(t, FONT_CAPTION) + 2, y - 4, m, FAINT, FONT_CAPTION);
+  };
+  one(x, ICON_SUNRISE, riseC, tr, mr);
+  one(x + second, ICON_SUNSET, setC, ts, ms);
 }
 
-// The day's sun/moon paths and rise/set. Today's comes from the weather task (computed on
-// the other core); other days (demo) are computed here once and kept (two slots).
-constexpr int PATH_STEPS = SKY_STEPS;
-const SkyDay& skyPaths(time_t t, float lat, float lon) {
-  static SkyDay cache[3];      // [0] today from the weather task, [1..2] demo days
-  static int next = 1;
+// The pass a body is on at time t (else its next one). For the current time it comes from the
+// weather task (computed on core 0); for demo times it is computed here once and kept.
+const SkyPass& passFor(bool moon, time_t t, float lat, float lon) {
+  static SkyPass shared[2];
+  static float sharedLat = 0, sharedLon = 0;
   static uint32_t polledAt = 0;
-  const time_t day = localMidnight(t);
-  auto match = [&](const SkyDay& c) { return c.day == day && c.lat == lat && c.lon == lon; };
-  for(const SkyDay& c : cache) if(match(c)) return c;
-  if(millis() - polledAt > 1000 || !polledAt) {   // the weather task may have a new day ready
-    polledAt = millis();
-    if(weatherSkyDay(cache[0]) && match(cache[0])) return cache[0];
+  static SkyPass kept[2][4];                    // demo: a few passes per body
+  static float keptLat[2][4], keptLon[2][4];
+  static int next[2] = {0, 0};
+  auto fits = [&](const SkyPass& p, float la, float lo, time_t slack) {
+    return p.valid && la == lat && lo == lon && p.from <= t && t <= p.set + slack;
+  };
+  if(!demo) {
+    if(millis() - polledAt > 1000 || !polledAt) { polledAt = millis(); weatherPasses(shared[0], shared[1], sharedLat, sharedLon); }
+    // just after the set the task is about to publish the next pass: keep the old one meanwhile
+    if(fits(shared[moon], sharedLat, sharedLon, 180)) return shared[moon];
   }
-  // Just after midnight the weather task may still be busy: yesterday's 48 h of paths still
-  // cover the next hours, so use them until today's arrives (no 300 ms stall on this core).
-  if(cache[0].day == day - 86400 && cache[0].lat == lat && cache[0].lon == lon) return cache[0];
-  SkyDay& p = cache[next]; next = next == 1 ? 2 : 1;
-  computeSkyDay(day, lat, lon, p);   // demo days, or before the weather task has one
-  return p;
+  for(int i = 0; i < 4; ++i) if(fits(kept[moon][i], keptLat[moon][i], keptLon[moon][i], 0)) return kept[moon][i];
+  const int i = next[moon]; next[moon] = (i + 1) % 4;
+  computePass(moon, t, lat, lon, kept[moon][i]);   // demo times, or before the task has one
+  keptLat[moon][i] = lat; keptLon[moon][i] = lon;
+  return kept[moon][i];
 }
 
 // Fraction of a unit disc covered by a disc of radius r at distance d (circle overlap area).
@@ -799,12 +811,18 @@ void drawSunMoonCard(int x,int y,int w,int h) {
   span(hx0 - 6, horizon, hx1 - hx0 + 12, FAINT, 120);
   text(x + 14, horizon - FONT_CAPTION.height / 2, "동", FAINT, FONT_CAPTION);
   text(hx1 + 8, horizon - FONT_CAPTION.height / 2, "서", FAINT, FONT_CAPTION);
-  const SkyDay& paths = skyPaths(t, lat, lon);
-  const int i0 = int((t - (paths.day + SKY_START_OFFSET)) / 600) - 72;   // 12 h before .. 12 h after
-  for(int i=std::max(0, i0); i<std::min(PATH_STEPS, i0 + 145); ++i) {
-    if(paths.sunAlt[i] >= 0) plot(int(skyX(paths.sunAz[i])), int(skyY(paths.sunAlt[i])), WARN, 150);
-    if(paths.moonAlt[i] >= 0) plot(int(skyX(paths.moonAz[i])), int(skyY(paths.moonAlt[i])), MUTED, 150);
-  }
+  // One whole pass per body (from its rise to its set): the pass it is on now, else the next one.
+  // The times under the chart are that pass's rise and set ("+1" when on the next day).
+  const SkyPass& sunP = passFor(false, localMidnight(t) + 12 * 3600, lat, lon);   // today's sun
+  const SkyPass& moonP = passFor(true, t, lat, lon);
+  auto drawPass = [&](const SkyPass& p, uint16_t c) {
+    if(!p.valid) return;
+    for(int i = 0; i < PASS_POINTS; ++i) if(p.alt[i] >= 0) plot(int(skyX(p.az[i])), int(skyY(p.alt[i])), c, 150);
+  };
+  drawPass(sunP, WARN);
+  drawPass(moonP, MUTED);
+  const time_t sunRise = sunP.valid ? sunP.rise : 0, sunSet = sunP.valid ? sunP.set : 0;
+  const time_t moonRise = moonP.valid ? moonP.rise : 0, moonSet = moonP.valid ? moonP.set : 0;
   // planets above the horizon, faded in and out with the darkness of the sky: the sun's depth
   // below the horizon (0 at the horizon .. 1 at -12 degrees) or, during a solar eclipse, how
   // much of the sun is hidden (0 at half .. 1 at all). Brighter planets show up earlier.
@@ -824,6 +842,9 @@ void drawSunMoonCard(int x,int y,int w,int h) {
       const unsigned alpha = unsigned(256 * ramp(start, start + 0.3f, darkness));
       if(!alpha) continue;
       const float px = skyX(sky.planetAz[i]), py = skyY(sky.planetAlt[i]);
+      // hidden behind the sun or the moon as drawn on the chart (disc + 3 px; the sun's glow too)
+      auto behind = [&](float az, float alt, float r) { return alt >= 0 && hypotf(px - skyX(az), py - skyY(alt)) < r + 3; };
+      if(behind(sunAz, sunAlt, solar ? 7.f : 11.f) || behind(moonAz, moonAlt, 7.f)) continue;
       disc(px, py, i == 1 || i == 3 ? 3.2f : 2.5f, COLORS[i], alpha);
       const int lx = int(px) + 4, ly = int(py) - FONT_CAPTION.height + 4;
       bool clear = true;
@@ -841,9 +862,7 @@ void drawSunMoonCard(int x,int y,int w,int h) {
   char line[48];
   snprintf(line, sizeof(line), "해 %d° · 달 %d°", int(lroundf(sunAlt)), int(lroundf(moonAlt)));
   centerText(x + 8, horizon + 8, half - 16, line, MUTED, FONT_CAPTION);
-  time_t rise, set;
-  riseSetFor(false, t, lat, lon, rise, set);
-  riseSetRow(x + 24, y + h - 32, rise, set, WARN, HEAT);
+  riseSetRow(x + 22, y + h - 32, sunRise, sunSet, WARN, HEAT, t, x + half - 6);
 
   // right: one big body. An eclipse in progress first, then the sun while it is up, else the moon
   const bool showSun = solar || (!(lunar && moonAlt > -1) && sunAlt >= 0);
@@ -874,8 +893,7 @@ void drawSunMoonCard(int x,int y,int w,int h) {
     snprintf(line, sizeof(line), "고도 %d°", int(lroundf(moonAlt)));   // below the horizon: negative, dimmed
     text(tx, y + 114, line, moonAlt >= 0 ? MUTED : FAINT, FONT_CAPTION);
   }
-  riseSetFor(true, t, lat, lon, rise, set);
-  riseSetRow(x + half + 22, y + h - 32, rise, set, MUTED, FAINT);
+  riseSetRow(x + half + 14, y + h - 32, moonRise, moonSet, MUTED, FAINT, t, x + w - 10);
 }
 
 void drawWeather() {
@@ -907,7 +925,8 @@ void drawWeather() {
   icon(ICON_WIND, S24, 344, 280, MUTED);
   snprintf(line, sizeof(line), "%.1fm/s", weather.wind); text(372, 280, line, TEXT, FONT_CAPTION);
   icon(ICON_SUN, S24, 470, 280, MUTED);
-  snprintf(line, sizeof(line), "UV %u", today.uv); text(498, 280, line, TEXT, FONT_CAPTION);
+  if(today.uv == 255) snprintf(line, sizeof(line), "UV --"); else snprintf(line, sizeof(line), "UV %u", today.uv);
+  text(498, 280, line, TEXT, FONT_CAPTION);
 
   if(skyReady()) drawSunMoon(618, 126, 382, 196);
   else { glass(618, 126, 382, 196, 26); centerText(618, 210, 382, "시간·위치 확인 중", FAINT); }

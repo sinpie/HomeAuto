@@ -188,7 +188,7 @@ bool fetch() {
     "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day"
     "&hourly=temperature_2m,weather_code,precipitation_probability"
     "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset,uv_index_max"
-    "&timezone=auto&forecast_days=7&wind_speed_unit=ms", lat, lon);
+    "&timezone=auto&forecast_days=7&wind_speed_unit=ms&models=ecmwf_ifs025", lat, lon);
   String body;
   if(!httpGet(url, body)) { error = failure("날씨 서버 연결 실패"); return false; }
   const char* b = body.c_str();
@@ -222,6 +222,7 @@ bool fetch() {
   numbers(daily, nullptr, "temperature_2m_max", dmax, WX_DAYS);
   numbers(daily, nullptr, "temperature_2m_min", dmin, WX_DAYS);
   numbers(daily, nullptr, "precipitation_probability_max", dp, WX_DAYS);
+  for(float& u : duv) u = -1;   // ECMWF gives no UV index (null): unknown unless filled below
   numbers(daily, nullptr, "uv_index_max", duv, WX_DAYS);
   const int nr = strings(daily, nullptr, "sunrise", rise, WX_DAYS);
   const int ns = strings(daily, nullptr, "sunset", set, WX_DAYS);
@@ -233,13 +234,25 @@ bool fetch() {
     WeatherDay& w = next.days[i];
     w = {uint8_t(d.tm_mon + 1), uint8_t(d.tm_mday), uint8_t(d.tm_wday), uint8_t(dc[i]),
          int8_t(lroundf(dmax[i])), int8_t(lroundf(dmin[i])), uint8_t(dp[i]),
-         uint16_t(i < nr ? minutesOf(rise[i]) : 0), uint16_t(i < ns ? minutesOf(set[i]) : 0), uint8_t(lroundf(duv[i]))};
+         uint16_t(i < nr ? minutesOf(rise[i]) : 0), uint16_t(i < ns ? minutesOf(set[i]) : 0), uint8_t(duv[i] < 0 ? 255 : lroundf(duv[i]))};
   }
   next.valid = nd > 0 && nh > 0;
   next.fetchedAt = millis();
   next.lat = lat; next.lon = lon;
   memcpy(next.place, place, sizeof(next.place));
   if(!next.valid) return false;   // a cut-off answer must not replace the forecast on screen
+  // UV index from Open-Meteo's default model (small second request; 255 = unknown if it fails)
+  {
+    snprintf(url, sizeof(url), "https://api.open-meteo.com/v1/forecast?latitude=%.2f&longitude=%.2f"
+             "&daily=uv_index_max&timezone=auto&forecast_days=7", lat, lon);
+    String uvBody;
+    if(httpGet(url, uvBody)) {
+      const char* uvDaily = section(uvBody.c_str(), "daily");
+      float uv[WX_DAYS];
+      const int nuv = uvDaily ? numbers(uvDaily, nullptr, "uv_index_max", uv, WX_DAYS) : 0;
+      for(int i = 0; i < nuv && i < nd; ++i) next.days[i].uv = uint8_t(lroundf(std::max(0.f, uv[i])));
+    }
+  }
   xSemaphoreTake(mutex, portMAX_DELAY);
   data = next;
   xSemaphoreGive(mutex);
@@ -297,9 +310,9 @@ void runSearch() {
   xSemaphoreGive(mutex);
 }
 
-SkyDay sky = {};          // published copy (mutex)
-bool skyReady = false;
-SkyDay skyWork;           // the task's working copy (static: ~2.4 KB)
+SkyPass sunPass = {}, moonPass = {};   // published passes for now (mutex)
+float passLat = 0, passLon = 0;
+SkyPass passWork;                      // the task's working copy
 
 // Requests from the UI (location picker), handled by the task.
 volatile bool ipRequested = false, ipKnown = false, ipFailed = false, newLocation = false;
@@ -330,14 +343,22 @@ void task(void*) {
       struct tm now;
       if(getLocalTime(&now, 0) && now.tm_year > 120) timeSet = true;
     }
-    if(timeSet && (lat != 0 || lon != 0)) {   // today's sun/moon paths: no network needed
+    if(timeSet && (lat != 0 || lon != 0)) {   // the sun's and the moon's passes for now: no network needed
       const time_t now = time(nullptr);
+      const bool moved = passLat != lat || passLon != lon;
       struct tm lt; localtime_r(&now, &lt);
-      const time_t day = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec);
-      if(!skyReady || sky.day != day || sky.lat != lat || sky.lon != lon) {
-        computeSkyDay(day, lat, lon, skyWork);
+      const time_t noon = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec) + 12 * 3600;
+      for(int body = 0; body < 2; ++body) {
+        SkyPass& published = body ? moonPass : sunPass;
+        // sun: today's pass (computed for local noon), new each day. Moon: the pass it is on or
+        // the next one, new after each set. Also on a new location, or 10 min after a failure.
+        const time_t at = body ? now : noon;
+        const bool stale = body ? now > published.set : published.from != noon;
+        const bool due = moved || (published.valid ? stale : (now - published.from > 600 || !published.from));
+        if(!due) continue;
+        computePass(body == 1, at, lat, lon, passWork);
         xSemaphoreTake(mutex, portMAX_DELAY);
-        sky = skyWork; skyReady = true;
+        published = passWork; passLat = lat; passLon = lon;
         xSemaphoreGive(mutex);
       }
     }
@@ -465,21 +486,50 @@ SearchState weatherSearchResults(PlaceResult* out, int max, int& count) {
   xSemaphoreGive(mutex);
   return searchState;
 }
-void computeSkyDay(time_t day, float la, float lo, SkyDay& out) {
-  out.day = day; out.lat = la; out.lon = lo;
-  for(int i = 0; i < SKY_STEPS; ++i) {
-    const time_t t = day + SKY_START_OFFSET + i * 600;
-    sunAzAlt(t, la, lo, out.sunAz[i], out.sunAlt[i]);
-    moonAzAlt(t, la, lo, out.moonAz[i], out.moonAlt[i]);
-    if(i % 48 == 47) vTaskDelay(1);   // seconds of math: let other work run
+bool computePass(bool moon, time_t t, float la, float lo, SkyPass& out) {
+  out = {};
+  out.from = t;
+  const float h0 = -0.833f;
+  int calls = 0;
+  auto alt = [&](time_t x) {
+    if(++calls % 40 == 0) vTaskDelay(1);   // long math: let other work on this core run
+    float az, h;
+    if(moon) moonAzAlt(x, la, lo, az, h); else sunAzAlt(x, la, lo, az, h);
+    return h;
+  };
+  // the crossing between lo and hi (one side above h0, the other below), to about 2 s
+  auto crossing = [&](time_t lo, time_t hi, bool rising) {
+    for(int i = 0; i < 10; ++i) {
+      const time_t mid = lo + (hi - lo) / 2;
+      ((alt(mid) >= h0) == rising ? hi : lo) = mid;
+    }
+    return lo + (hi - lo) / 2;
+  };
+  const time_t step = 1800;   // 30 min: shorter than any part of a pass that could be skipped here
+  time_t a = t;
+  int n = 0;
+  if(alt(t) >= h0) {          // up now: back to its rise
+    while(alt(a - step) >= h0) { a -= step; if(++n > 60) return false; }   // up for > 30 h: no pass
+    out.rise = crossing(a - step, a, true);
+  } else {                    // down now: on to the next rise
+    while(alt(a + step) < h0) { a += step; if(++n > 60) return false; }    // not rising within 30 h
+    out.rise = crossing(a, a + step, true);
   }
-  sunRiseSet(day, la, lo, out.sunRise, out.sunSet);
-  moonRiseSet(day, la, lo, out.moonRise, out.moonSet);
+  time_t b = out.rise + 60;
+  n = 0;
+  while(alt(b + step) >= h0) { b += step; if(++n > 60) return false; }
+  out.set = crossing(b, b + step, false);
+  for(int i = 0; i < PASS_POINTS; ++i) {
+    const time_t x = out.rise + (out.set - out.rise) * i / (PASS_POINTS - 1);
+    if(moon) moonAzAlt(x, la, lo, out.az[i], out.alt[i]); else sunAzAlt(x, la, lo, out.az[i], out.alt[i]);
+  }
+  out.valid = true;
+  return true;
 }
-bool weatherSkyDay(SkyDay& out) {
+bool weatherPasses(SkyPass& sun, SkyPass& moon, float& la, float& lo) {
   xSemaphoreTake(mutex, portMAX_DELAY);
-  const bool ok = skyReady;
-  if(ok) out = sky;
+  const bool ok = sunPass.valid || moonPass.valid;
+  sun = sunPass; moon = moonPass; la = passLat; lo = passLon;
   xSemaphoreGive(mutex);
   return ok;
 }

@@ -34,7 +34,7 @@ HomePanel은 7인치 ESP32-P4 보드(GUITION JC1060P470C_I_W_Y)에서 돌아가�
 | `panel.cpp/.h` | MIPI-DSI(JD9165) 패널, 프레임 버퍼 2개 + vsync 전환, 백라이트, GT911 터치(I2C) |
 | `assets.cpp/.h`, `assets_data.h`, `font_data.h` | `ffat` 파티션의 화면 자원(배경·아이콘·글꼴)을 mmap. `assets_data.h`는 생성 파일(아이콘 ID) |
 | `wallpad_link.cpp/.h` | 네트워크(WiFi/이더넷), EW11 TCP 연결, SDS 패킷 해석, 장치 상태, 명령 송신(화이트리스트) |
-| `weather.cpp/.h` | 위치(저장값 → 설정값 → IP 추정), NTP, Open-Meteo 예보(실패 시 2→30분 간격), 지명·장소 검색, 일식·월식 탐색, 오늘의 해·달 경로(48시간, 10분 간격) |
+| `weather.cpp/.h` | 위치(저장값 → 설정값 → IP 추정), NTP, Open-Meteo 예보(ECMWF, 실패 시 2→30분 간격), 지명·장소 검색, 일식·월식 탐색, 해·달 경로(뜰 때~질 때 한 번, 72점: 해는 오늘, 달은 지금/다음) |
 | `astro.cpp/.h` | 해·달(Meeus 저정밀 급수)·행성(JPL 근사 요소, 세차 보정) 위치, 방위·고도, 뜨고 지는 시각, 달 위상, 일식·월식 탐색과 그리기용 기하 |
 | `geo_map.cpp/.h` | 위치 설정 지도: Esri 도로(≤13단계)/위성(14~17) 타일 JPEG를 하드웨어로 풀고, 위성 위에 도로·지명 PNG(ROM miniz로 해제)를 합성, PSRAM 40장 캐시. TLS 연결 재사용 |
 | `board_config.h` | 화면·핀 상수, `local_config.h`(비공개) 포함 |
@@ -48,7 +48,7 @@ HomePanel은 7인치 ESP32-P4 보드(GUITION JC1060P470C_I_W_Y)에서 돌아가�
 
 [wallpad 태스크]  EW11 TCP 수신 → 패킷 분리(체크섬) → 상태(shared) 갱신 ─┐   (명령은 30ms 조용한 빈 슬롯에 송신,
                                                                        │    우리 패킷 직후의 응답만 성공으로 인정)
-[weather 태스크]  NTP(부팅 즉시) → 오늘의 하늘 경로 → 위치 → Open-Meteo → WeatherData ┤
+[weather 태스크]  NTP(부팅 즉시) → 해·달 경로(지면 다음 것) → 위치 → Open-Meteo → WeatherData ┤
                  (검색·IP·위치 변경 요청 처리, 하루 한 번 일식·월식 3년치 탐색)        │
 [map 태스크]     지도 화면이 요청한 타일 → HTTPS(연결 재사용) → JPEG/PNG → 캐시 ──────┤
 [loop (UI)]  250ms마다 스냅샷 복사 → 서명(signature) 비교 → 바뀌었으면 dirty ─────────┘
@@ -63,7 +63,7 @@ HomePanel은 7인치 ESP32-P4 보드(GUITION JC1060P470C_I_W_Y)에서 돌아가�
   그림을 AXI DMA로 복사(`glassBegin`; 카드 구성이 바뀌면 그 프레임만 직접 그리고 저장) → 글자·값·아이콘 → 오버레이
   (가스 확인, 방문 호출, 알림) → 누름 표시 → `panelPresent`(기다리지 않음).
 - **하늘 상태**: 해·달·행성·식 상태는 `skyNow()`가 1초에 한 번 계산해 홈 카드와 날씨 탭이 같이 씁니다.
-  오늘의 경로·뜨고 지는 시각은 weather 태스크(코어 0)가 미리 계산합니다(UI 코어에서는 체험 모드 날짜만).
+  해·달 경로와 뜨고 지는 시각은 weather 태스크(코어 0)가 미리 계산합니다(UI 코어에서는 체험 모드 날짜만, 한 번).
 - **측정**: 시리얼 `PERF`(그리기 구간별 시간, 루프 멈춤, 메모리, 스택, 지도 타일 통계).
 
 ## 화면 자원 파이프라인

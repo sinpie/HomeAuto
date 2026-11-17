@@ -67,18 +67,20 @@ SearchState weatherSearchResults(PlaceResult* out, int max, int& count);
 // Upcoming eclipses for the location (astro.h); empty until the first search finished.
 int weatherEclipses(Eclipse* out, int max);
 
-// Today's sky for the sun & moon card: azimuth/altitude every 10 minutes from 12 h before
-// local midnight to 12 h after the next one (so a path around "now" is never cut at
-// midnight), and the day's rise/set times. Computed by the weather task once a day.
-constexpr int SKY_STEPS = 289;
-constexpr long SKY_START_OFFSET = -12 * 3600;   // first sample relative to local midnight
-struct SkyDay {
-  time_t day; float lat, lon;
-  float sunAz[SKY_STEPS], sunAlt[SKY_STEPS], moonAz[SKY_STEPS], moonAlt[SKY_STEPS];
-  time_t sunRise, sunSet, moonRise, moonSet;
+// One pass of the sun or the moon across the sky, from its rise to its set (-0.833 degrees:
+// refraction and the disc's edge), sampled at PASS_POINTS evenly spaced times. The pass is the
+// one the body is on at the given time, else its next one, so it is always whole.
+constexpr int PASS_POINTS = 72;
+struct SkyPass {
+  bool valid;
+  time_t from;                 // time it was computed for: valid for from <= t <= set
+  time_t rise, set;
+  float az[PASS_POINTS], alt[PASS_POINTS];
 };
-void computeSkyDay(time_t dayStart, float lat, float lon, SkyDay& out);
-bool weatherSkyDay(SkyDay& out);   // false until the first one is ready
+// A fraction of a second of math (searches the rise and set, then samples): core 0 or rarely.
+bool computePass(bool moon, time_t t, float lat, float lon, SkyPass& out);
+// The passes for now, kept up to date by the weather task (false until the first ones exist).
+bool weatherPasses(SkyPass& sun, SkyPass& moon, float& lat, float& lon);
 
 // Moon phase name for an age in days (astro.h moonAge).
 const char* moonPhaseName(float age);
