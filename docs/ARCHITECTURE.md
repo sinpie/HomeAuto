@@ -33,7 +33,7 @@ HomePanel은 7인치 ESP32-P4 보드(GUITION JC1060P470C_I_W_Y)에서 돌아가�
 | `gfx.cpp/.h` | 소프트웨어 렌더러: RGB565 알파 블렌딩, 안티앨리어싱 둥근 사각형(SDF), 4비트 글꼴·아이콘, 공용 색 |
 | `panel.cpp/.h` | MIPI-DSI(JD9165) 패널, 프레임 버퍼 2개 + vsync 전환, 백라이트, GT911 터치(I2C) |
 | `assets.cpp/.h`, `assets_data.h`, `font_data.h` | `ffat` 파티션의 화면 자원(배경·아이콘·글꼴)을 mmap. `assets_data.h`는 생성 파일(아이콘 ID) |
-| `wallpad_link.cpp/.h` | 네트워크(WiFi/이더넷), EW11 TCP 연결, SDS 패킷 해석, 장치 상태, 명령 송신(화이트리스트) |
+| `wallpad_link.cpp/.h` | 네트워크(WiFi/이더넷), EW11 TCP 연결, SDS 패킷 해석, 장치 상태, 명령 송신(화이트리스트, 장치별 마지막 값 대기열, 간격·횟수 제한) |
 | `weather.cpp/.h` | 위치(저장값 → 설정값 → IP 추정), NTP, Open-Meteo 예보(ECMWF, 실패 시 2→30분 간격), 지명·장소 검색, 일식·월식 탐색, 해·달 경로(뜰 때~질 때 한 번, 72점: 해는 오늘, 달은 지금/다음) |
 | `astro.cpp/.h` | 해·달(Meeus 저정밀 급수)·행성(JPL 근사 요소, 세차 보정) 위치, 방위·고도, 뜨고 지는 시각, 달 위상, 일식·월식 탐색과 그리기용 기하 |
 | `geo_map.cpp/.h` | 위치 설정 지도: Esri 도로(≤13단계)/위성(14~17) 타일 JPEG를 하드웨어로 풀고, 위성 위에 도로·지명 PNG(ROM miniz로 해제)를 합성, PSRAM 40장 캐시. TLS 연결 재사용 |
@@ -47,7 +47,8 @@ HomePanel은 7인치 ESP32-P4 보드(GUITION JC1060P470C_I_W_Y)에서 돌아가�
 코어 0: wallpad(우선순위 4), weather(1), map(1) — 코어 1: UI 루프(Arduino loopTask)만.
 
 [wallpad 태스크]  EW11 TCP 수신 → 패킷 분리(체크섬) → 상태(shared) 갱신 ─┐   (명령은 30ms 조용한 빈 슬롯에 송신,
-                                                                       │    우리 패킷 직후의 응답만 성공으로 인정)
+                                                                       │    우리 패킷 직후의 응답만 성공으로 인정,
+                                                                       │    UI는 기다리지 않음: 대기열에 장치별 마지막 값)
 [weather 태스크]  NTP(부팅 즉시) → 해·달 경로(지면 다음 것) → 위치 → Open-Meteo → WeatherData ┤
                  (검색·IP·위치 변경 요청 처리, 하루 한 번 일식·월식 3년치 탐색)        │
 [map 태스크]     지도 화면이 요청한 타일 → HTTPS(연결 재사용) → JPEG/PNG → 캐시 ──────┤

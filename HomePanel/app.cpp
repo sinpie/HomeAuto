@@ -82,7 +82,7 @@ bool recentCall(uint64_t at, uint64_t span) { return at && nowMs()-at < span; }
 uint32_t minuteStamp() { return clockReady() ? uint32_t(time(nullptr) / 60) : millis() / 60000; }
 char noticeText[96] = ""; uint32_t noticeAt = 0;
 void notice(const char* text) { snprintf(noticeText, sizeof(noticeText), "%s", text); noticeAt = millis(); }
-void commandBusy() { notice("월패드 명령을 보낼 수 없습니다 · 이전 명령 처리 중이거나 연결 끊김"); }
+void commandBusy() { notice("월패드 명령을 보낼 수 없습니다 · 연결 끊김 또는 대기 명령이 많음"); }
 void flash(int x,int y,int w,int h,int r=18) { flashX=x; flashY=y; flashW=w; flashH=h; flashR=r; flashUntil=millis()+160; }
 void formatFloor(char* out,size_t n,int floor) {
   if(floor==0) snprintf(out, n, "--");
@@ -392,12 +392,37 @@ const WallpadSnapshot& devices() { return demo ? demoDevices() : wallpad; }
 // State of the device command addressed to (kind, target), for card feedback.
 CommandState commandFor(CommandKind kind, uint8_t target, CommandKind alsoKind = CMD_NONE) {
   if(demo) return CMD_IDLE;
+  for(int i = 0; i < wallpad.queued; ++i)
+    if((wallpad.queue[i].kind == kind || wallpad.queue[i].kind == alsoKind) && wallpad.queue[i].target == target) return CMD_SENDING;
   const CommandStatus& c = wallpad.command;
   if((c.kind != kind && c.kind != alsoKind) || c.target != target) return CMD_IDLE;
   if(c.state == CMD_SENDING) return CMD_SENDING;
   if(c.state == CMD_FAILED && millis() - c.at < 5000) return CMD_FAILED;
   if(c.state == CMD_DONE && millis() - c.at < 2500) return CMD_DONE;
   return CMD_IDLE;
+}
+// Newest value asked for (kind, target): queued, being sent, or done within 10 s (the bus
+// polls each heating zone again only after several seconds, so the report lags the reply).
+// Taps build on it, so quick taps do not repeat a stale value.
+bool requested(CommandKind kind, uint8_t target, int& value) {
+  if(demo) return false;
+  for(int i = wallpad.queued - 1; i >= 0; --i)
+    if(wallpad.queue[i].kind == kind && wallpad.queue[i].target == target) { value = wallpad.queue[i].value; return true; }
+  const CommandStatus& c = wallpad.command;
+  if(c.kind != kind || c.target != target) return false;
+  if(c.state == CMD_SENDING || (c.state == CMD_DONE && millis() - c.at < 10000)) { value = c.value; return true; }
+  return false;
+}
+// After a command call: never waits; refresh the snapshot so the next tap sees the queue.
+void sent(bool ok) { if(!ok) commandBusy(); wallpad = wallpadSnapshot(); dirty = true; }
+VentState ventRequested(VentState v) {
+  int code;
+  if(!requested(CMD_VENT, 0, code)) return v;
+  if(code == 0x06) v.on = false;
+  else if(code == 0x05) v.on = true;
+  else if(code == 0x04) { v.on = true; v.automatic = true; }
+  else { v.on = true; v.automatic = false; v.speed = uint8_t(4 - code); }
+  return v;
 }
 // Overrides a card's status text while a command for it is running or just failed.
 bool commandStatus(CommandState st, char* status, size_t n, uint16_t& color, const char* doneText) {
@@ -1349,9 +1374,10 @@ void drawBoiler() {
     text(x+24, y+48, status, statusColor, FONT_CAPTION);
     // power switch
     const int sx = x + w - 24 - 72, sy = y + 18;
+    int onNow = r.on; requested(CMD_HEAT_POWER, uint8_t(i + 1), onNow);
     if(r.known) {
-      shape(sx, sy, 72, 40, 20, r.on ? HEAT : WHITE, r.on ? 256 : 44);
-      circle(r.on ? sx+52 : sx+20, sy+20, 15, r.on ? WHITE : MUTED);
+      shape(sx, sy, 72, 40, 20, onNow ? HEAT : WHITE, onNow ? 256 : 44);
+      circle(onNow ? sx+52 : sx+20, sy+20, 15, onNow ? WHITE : MUTED);
     } else shape(sx, sy, 72, 40, 20, WHITE, 20);
     // current temperature
     char cur[16]; formatDegrees(cur, sizeof(cur), r, false);
@@ -1359,8 +1385,11 @@ void drawBoiler() {
     text(x+22, y+116, cur, r.known ? TEXT : FAINT, FONT_DISPLAY);
     // set temperature with -/+
     char set[16]; formatDegrees(set, sizeof(set), r, true);
-    centerText(x+w-150, y+90, 108, "설정", FAINT, FONT_CAPTION);
-    centerText(x+w-150, y+122, 108, set, r.known ? TEXT : FAINT, FONT_TITLE);
+    int want = r.set;
+    const bool changing = r.known && requested(CMD_HEAT_SET, uint8_t(i + 1), want) && want != r.set;
+    if(changing) snprintf(set, sizeof(set), "%d°", want);   // asked for, not reported by the bus yet
+    centerText(x+w-150, y+90, 108, changing ? "설정 중" : "설정", changing ? ACCENT : FAINT, FONT_CAPTION);
+    centerText(x+w-150, y+122, 108, set, changing ? ACCENT : (r.known ? TEXT : FAINT), FONT_TITLE);
     if(r.known) {
       circle(x+w-172, y+140, 22, WHITE, 34); iconCenter(ICON_MINUS, S24, x+w-172, y+140, TEXT);
       circle(x+w-46, y+140, 22, WHITE, 34); iconCenter(ICON_PLUS, S24, x+w-46, y+140, TEXT);
@@ -1382,15 +1411,15 @@ bool boilerTap(int x,int y) {
     const uint8_t group = uint8_t(i + 1);
     if(inside(x, y, rx+w-24-72-12, ry+6, 96, 64)) {                  // power switch
       flash(rx+w-24-72, ry+18, 72, 40, 20);
-      if(demo && demoRoomsPtr) demoRoomsPtr[i].on = !r.on; else if(!wallpadHeatingPower(group, !r.on)) commandBusy();
-    } else if(inside(x, y, rx+w-172-32, ry+108, 64, 64)) {          // set -1
-      flash(rx+w-194, ry+118, 44, 44, 22);
-      const int t = std::max(10, r.set - 1);
-      if(demo && demoRoomsPtr) demoRoomsPtr[i].set = t; else if(!wallpadHeatingSet(group, uint8_t(t))) commandBusy();
-    } else if(inside(x, y, rx+w-46-32, ry+108, 64, 64)) {           // set +1
-      flash(rx+w-68, ry+118, 44, 44, 22);
-      const int t = std::min(30, r.set + 1);
-      if(demo && demoRoomsPtr) demoRoomsPtr[i].set = t; else if(!wallpadHeatingSet(group, uint8_t(t))) commandBusy();
+      int on = r.on; requested(CMD_HEAT_POWER, group, on);
+      if(demo && demoRoomsPtr) demoRoomsPtr[i].on = !r.on; else sent(wallpadHeatingPower(group, !on));
+    } else if(inside(x, y, rx+w-172-32, ry+108, 64, 64) || inside(x, y, rx+w-46-32, ry+108, 64, 64)) {   // set -1 / +1
+      const bool up = x >= rx+w-46-32;
+      flash(up ? rx+w-68 : rx+w-194, ry+118, 44, 44, 22);
+      int base = r.set; requested(CMD_HEAT_SET, group, base);   // keeps counting from the last tap
+      const int t = std::min(30, std::max(10, base + (up ? 1 : -1)));
+      if(demo && demoRoomsPtr) demoRoomsPtr[i].set = t;
+      else if(t != base) sent(wallpadHeatingSet(group, uint8_t(t)));
     }
     return true;
   }
@@ -1434,7 +1463,8 @@ void controlCard(int x,int y,const ControlCard& card) {
       active = on > 0;
       statusColor = active ? HEAT : MUTED;
       dots = std::min<int>(g.count, 4); dotBits = g.bits;
-      action1 = on ? "끄기" : "켜기";
+      int wantOn = on > 0; requested(CMD_LIGHT, uint8_t(card.index + 1), wantOn);
+      action1 = wantOn ? "끄기" : "켜기";
       commandStatus(commandFor(CMD_LIGHT, card.index + 1), status, sizeof(status), statusColor, nullptr);
       break;
     }
@@ -1446,10 +1476,9 @@ void controlCard(int x,int y,const ControlCard& card) {
       else snprintf(status, sizeof(status), "%u단", d.vent.speed);
       active = d.vent.on;
       statusColor = active ? HEAT : MUTED;
-      action2 = d.vent.on ? "끄기" : "켜기";
+      action2 = ventRequested(d.vent).on ? "끄기" : "켜기";
       action1 = "풍량";
-      for(uint8_t code=1; code<=6; ++code)
-        if(commandStatus(commandFor(CMD_VENT, code), status, sizeof(status), statusColor, nullptr)) break;
+      commandStatus(commandFor(CMD_VENT, 0), status, sizeof(status), statusColor, nullptr);
       break;
     case CARD_OUTLET: {
       const OutletState& o = d.outlets[card.index];
@@ -1458,7 +1487,8 @@ void controlCard(int x,int y,const ControlCard& card) {
       snprintf(detail, sizeof(detail), "%uW", o.watts);
       active = o.mode != 0x10;
       statusColor = active ? HEAT : MUTED;
-      action1 = active ? "끄기" : "켜기";
+      int wantOn = active; requested(CMD_OUTLET, uint8_t(card.index + 1), wantOn);
+      action1 = wantOn ? "끄기" : "켜기";
       commandStatus(commandFor(CMD_OUTLET, card.index + 1), status, sizeof(status), statusColor, nullptr);
       break;
     }
@@ -1530,20 +1560,22 @@ bool controlTap(int x,int y) {
       case CARD_LIGHT: {
         if(!right) return true;
         const LightGroup& g = d.lights[c.index];
-        const bool on = (g.bits & ((1u << g.count) - 1)) != 0;
+        int on = (g.bits & ((1u << g.count) - 1)) != 0;
+        requested(CMD_LIGHT, uint8_t(c.index + 1), on);
         if(demo) demoDevices().lights[c.index].bits = on ? 0 : uint8_t((1u << g.count) - 1);
-        else if(!wallpadLight(c.index + 1, !on)) commandBusy();
+        else sent(wallpadLight(c.index + 1, !on));
         return true;
       }
       case CARD_OUTLET: {
         if(!right) return true;
-        const bool on = d.outlets[c.index].mode != 0x10;
+        int on = d.outlets[c.index].mode != 0x10;
+        requested(CMD_OUTLET, uint8_t(c.index + 1), on);
         if(demo) demoDevices().outlets[c.index].mode = on ? 0x10 : 0x01;
-        else if(!wallpadOutletPower(c.index + 1, !on)) commandBusy();
+        else sent(wallpadOutletPower(c.index + 1, !on));
         return true;
       }
       case CARD_VENT: {
-        const VentState& v = d.vent;
+        const VentState v = ventRequested(d.vent);
         const uint8_t code = right ? nextVentCode(v) : (v.on ? 0x06 : 0x05);
         if(demo) {
           VentState& dv = demoDevices().vent;
@@ -1551,7 +1583,7 @@ bool controlTap(int x,int y) {
           else if(code == 0x05) dv.on = true;
           else if(code == 0x04) { dv.on = true; dv.automatic = true; }
           else { dv.on = true; dv.automatic = false; dv.speed = uint8_t(4 - code); }
-        } else if(!wallpadVent(code)) commandBusy();
+        } else sent(wallpadVent(code));
         return true;
       }
       default:
@@ -1729,7 +1761,7 @@ void tap(int x,int y) {
     else if(inside(x,y,524,366,180,60)) {
       flash(524,366,180,60);
       gasConfirm = false;
-      if(demo) { demoGasDoneAt = millis(); demoDevices().gas.closedAt = nowMs(); } else if(!wallpadCloseGas()) commandBusy();
+      if(demo) { demoGasDoneAt = millis(); demoDevices().gas.closedAt = nowMs(); } else sent(wallpadCloseGas());
     }
     return;
   }
@@ -1785,7 +1817,9 @@ void serialLine(const String& line) {
   if(line=="DEV") {
     const WallpadSnapshot w = wallpadSnapshot();
     Serial.printf("DEV|gas|%d|closed_ms_ago|%lu\n", w.gas.seen, w.gas.closedAt ? (unsigned long)(nowMs() - w.gas.closedAt) : 0UL);
-    Serial.printf("DEV|command|state|%d|kind|%d|target|%u|attempts|%u\n", w.command.state, w.command.kind, w.command.target, w.command.attempts);
+    Serial.printf("DEV|command|state|%d|kind|%d|target|%u|value|%u|attempts|%u|queued|%u\n", w.command.state, w.command.kind, w.command.target, w.command.value, w.command.attempts, w.queued);
+    for(int i=0; i<w.queued; ++i) Serial.printf("DEV|queue|%d|kind|%d|target|%u|value|%u\n", i, w.queue[i].kind, w.queue[i].target, w.queue[i].value);
+    for(int i=0; i<HEAT_ZONES; ++i) if(w.zones[i].seen) Serial.printf("DEV|heat|%d|on|%d|set|%u|current|%u\n", i+1, w.zones[i].on, w.zones[i].set, w.zones[i].current);
     for(int i=0; i<LIGHT_GROUPS; ++i) if(w.lights[i].seen) Serial.printf("DEV|light|%d|%u|%02X\n", i+1, w.lights[i].count, w.lights[i].bits);
     for(int i=0; i<OUTLETS; ++i) if(w.outlets[i].seen) Serial.printf("DEV|outlet|%d|%02X|%u\n", i+1, w.outlets[i].mode, w.outlets[i].watts);
     Serial.printf("DEV|vent|%d|%d|%u|%d\n", w.vent.seen, w.vent.on, w.vent.speed, w.vent.automatic);
@@ -1905,6 +1939,9 @@ void loop() {
   if(millis()-lastWallpadPoll > 250) {
     lastWallpadPoll = millis();
     wallpad = wallpadSnapshot();
+    static bool graceShown = false;   // requested() stops showing a done command after 10 s: redraw then
+    const bool grace = wallpad.command.state == CMD_DONE && millis() - wallpad.command.at < 10000;
+    if(grace != graceShown) { graceShown = grace; dirty = true; }
     static uint32_t seenBells = 0, seenOpens = 0, seenCalls = 0, seenArrivals = 0;
     if(!demo) {
       if(wallpad.doorbells != seenBells) addRing(wallpad.lastDoorbell == 1 ? 0 : 1);  // home door / common door

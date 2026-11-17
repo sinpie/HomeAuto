@@ -56,6 +56,17 @@ uint32_t cmdSentAt = 0;
 bool justSent = false;   // our packet went out and no wallpad packet followed yet: the next reply is ours
 bool sendSlot = false;  // the wallpad just polled a device that does not answer: the bus is free
 
+// Queued commands (shared.queue holds kind/target/value; the packets are kept here, same order).
+struct QueuedPacket { uint8_t bytes[10]; uint8_t length, reply1, reply2, group; };
+QueuedPacket queuedPackets[COMMAND_QUEUE];
+// Pacing per device: no device gets commands back to back or without limit (toggle loops).
+constexpr uint32_t CMD_SPACING_MS = 1000;
+constexpr uint32_t CMD_WINDOW_MS = 60000;
+constexpr uint8_t CMD_PER_WINDOW = 8;
+struct Pace { CommandKind kind; uint8_t target; uint32_t lastAt, windowAt; uint8_t count; };
+Pace paces[12] = {};
+void startQueuedLocked();
+
 void startWifi() {
   ownDisconnect = true;  // the reason-8 event this causes is not the failure we want to see
   WiFi.disconnect();
@@ -349,6 +360,7 @@ void linkTask(void*) {
     portENTER_CRITICAL(&lock);
     if(shared.command.state == CMD_SENDING) { shared.command.state = CMD_FAILED; shared.command.at = millis(); }
     cmdRequested = false;
+    shared.queued = 0;   // nothing waits across a link drop
     portEXIT_CRITICAL(&lock);
   };
   for(;;) {
@@ -377,6 +389,11 @@ void linkTask(void*) {
       lastByte = millis();
     }
     publish(WALLPAD_CONNECTED, uint32_t(ip));
+    if(!cmdRequested && shared.queued) {
+      portENTER_CRITICAL(&lock);
+      startQueuedLocked();
+      portEXIT_CRITICAL(&lock);
+    }
     if(cmdRequested) {
       // Read the state and clear the request in one critical section: a new command
       // queued by the UI in between must not be dropped.
@@ -476,48 +493,104 @@ void wallpadDiagnose(Print& out, const char* targetSsid, bool scan) {
   out.println("NET|done");
 }
 
+namespace {
+// Pacing record of a device (call with the lock held). Reuses the least recently used slot.
+Pace& paceLocked(CommandKind kind, uint8_t target) {
+  Pace* oldest = &paces[0];
+  for(Pace& p : paces) {
+    if(p.kind == kind && p.target == target) return p;
+    if(p.kind == CMD_NONE || (oldest->kind != CMD_NONE && int32_t(p.lastAt - oldest->lastAt) < 0)) oldest = &p;
+  }
+  *oldest = {kind, target, 0, 0, 0};
+  return *oldest;
+}
+bool paceAllowsLocked(CommandKind kind, uint8_t target, uint32_t now) {
+  const Pace& p = paceLocked(kind, target);
+  if(p.count == 0) return true;
+  if(now - p.lastAt < CMD_SPACING_MS) return false;
+  return now - p.windowAt >= CMD_WINDOW_MS || p.count < CMD_PER_WINDOW;
+}
+void dropQueuedLocked(int i) {
+  for(int j = i; j + 1 < shared.queued; ++j) { shared.queue[j] = shared.queue[j+1]; queuedPackets[j] = queuedPackets[j+1]; }
+  --shared.queued;
+}
+// Make queue entry i the running command (lock held, sender free).
+void beginLocked(int i, uint32_t now) {
+  const QueuedCommand q = shared.queue[i];
+  const QueuedPacket& k = queuedPackets[i];
+  memcpy(cmdPacket, k.bytes, k.length);
+  cmdLength = k.length;
+  expectReply1 = k.reply1; expectReply2 = k.reply2; expectGroup = k.group;
+  shared.command = {CMD_SENDING, q.kind, q.target, 0, now, q.value};
+  cmdRequested = true;
+  Pace& p = paceLocked(q.kind, q.target);
+  if(p.count == 0 || now - p.windowAt >= CMD_WINDOW_MS) { p.windowAt = now; p.count = 0; }
+  ++p.count; p.lastAt = now;
+  dropQueuedLocked(i);
+}
+// Start the oldest queued command its device's pacing allows (lock held, sender free).
+void startQueuedLocked() {
+  const uint32_t now = millis();
+  for(int i = 0; i < shared.queued; ++i)
+    if(paceAllowsLocked(shared.queue[i].kind, shared.queue[i].target, now)) { beginLocked(i, now); return; }
+}
+}  // namespace
+
 // Queue one command packet (checksum appended). Only the builders below call this.
-bool startCommand(CommandKind kind, uint8_t target, std::initializer_list<uint8_t> body,
+bool startCommand(CommandKind kind, uint8_t target, uint8_t value, std::initializer_list<uint8_t> body,
                   uint8_t reply1, uint8_t reply2, uint8_t group) {
-  if(body.size() + 1 > sizeof(cmdPacket)) return false;
+  if(body.size() + 1 > sizeof(QueuedPacket::bytes)) return false;
+  QueuedPacket k = {};
+  uint8_t x = 0;
+  for(uint8_t b : body) { k.bytes[k.length++] = b; x ^= b; }
+  k.bytes[k.length++] = x & 0x7F;
+  k.reply1 = reply1; k.reply2 = reply2; k.group = group;
   bool ok = false;
   portENTER_CRITICAL(&lock);
-  if(shared.state == WALLPAD_CONNECTED && shared.command.state != CMD_SENDING) {
-    int n = 0; uint8_t x = 0;
-    for(uint8_t b : body) { cmdPacket[n++] = b; x ^= b; }
-    cmdPacket[n++] = x & 0x7F;
-    cmdLength = n;
-    expectReply1 = reply1; expectReply2 = reply2; expectGroup = group;
-    shared.command = {CMD_SENDING, kind, target, 0, millis()};
-    cmdRequested = true;
-    ok = true;
+  if(shared.state == WALLPAD_CONNECTED) {
+    int slot = -1;
+    for(int i = 0; i < shared.queued; ++i)
+      if(shared.queue[i].kind == kind && shared.queue[i].target == target) slot = i;
+    const CommandStatus& c = shared.command;
+    if(c.state == CMD_SENDING && c.kind == kind && c.target == target && c.value == value) {
+      if(slot >= 0) dropQueuedLocked(slot);   // back to the value being sent: the queued change is cancelled
+      ok = true;
+    } else {
+      if(slot < 0 && shared.queued < COMMAND_QUEUE) slot = shared.queued++;
+      if(slot >= 0) {
+        shared.queue[slot] = {kind, target, value};
+        queuedPackets[slot] = k;
+        if(c.state != CMD_SENDING) startQueuedLocked();   // sender free: send now if pacing allows
+        ok = true;
+      }
+    }
   }
   portEXIT_CRITICAL(&lock);
   return ok;
 }
 
 bool wallpadCloseGas() {
-  return startCommand(CMD_GAS_CLOSE, 0, {0xAB, 0x78, 0x00}, 0x78, 0x78, 0xFF);
+  return startCommand(CMD_GAS_CLOSE, 0, 1, {0xAB, 0x78, 0x00}, 0x78, 0x78, 0xFF);
 }
 bool wallpadHeatingPower(uint8_t group, bool on) {
   if(group < 1 || group > HEAT_ZONES) return false;
-  return startCommand(CMD_HEAT_POWER, group, {0xAE, 0x7D, group, uint8_t(on), 0, 0, 0}, 0x7D, 0x7D, group);
+  return startCommand(CMD_HEAT_POWER, group, uint8_t(on), {0xAE, 0x7D, group, uint8_t(on), 0, 0, 0}, 0x7D, 0x7D, group);
 }
 bool wallpadHeatingSet(uint8_t group, uint8_t celsius) {
   if(group < 1 || group > HEAT_ZONES || celsius < 10 || celsius > 30) return false;
-  return startCommand(CMD_HEAT_SET, group, {0xAE, 0x7F, group, celsius, 0, 0, 0}, 0x7F, 0x7F, group);
+  return startCommand(CMD_HEAT_SET, group, celsius, {0xAE, 0x7F, group, celsius, 0, 0, 0}, 0x7F, 0x7F, group);
 }
 bool wallpadLight(uint8_t group, bool on) {
   if(group > LIGHT_GROUPS || (group == 0 && on)) return false;
-  return startCommand(CMD_LIGHT, group, {0xAC, 0x7A, group, uint8_t(on)}, 0x79, 0x7A, group);
+  return startCommand(CMD_LIGHT, group, uint8_t(on), {0xAC, 0x7A, group, uint8_t(on)}, 0x79, 0x7A, group);
 }
 bool wallpadOutletPower(uint8_t outlet, bool on) {
   if(outlet < 1 || outlet > OUTLETS) return false;
-  return startCommand(CMD_OUTLET, outlet, {0xC6, 0x6E, outlet, uint8_t(on), 0, 0, 0, 0, 0}, 0x6E, 0x6E, outlet);
+  return startCommand(CMD_OUTLET, outlet, uint8_t(on), {0xC6, 0x6E, outlet, uint8_t(on), 0, 0, 0, 0, 0}, 0x6E, 0x6E, outlet);
 }
 bool wallpadVent(uint8_t code) {
   if(code < 1 || code > 6) return false;
-  return startCommand(CMD_VENT, code, {0xC2, 0x4F, code, 0, 0}, 0x4F, 0x4F, 0xFF);
+  return startCommand(CMD_VENT, 0, code, {0xC2, 0x4F, code, 0, 0}, 0x4F, 0x4F, 0xFF);
 }
 
 WallpadSnapshot wallpadSnapshot() {

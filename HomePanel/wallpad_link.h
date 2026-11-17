@@ -64,7 +64,11 @@ struct WallClock { bool valid; uint8_t year, month, day, hour, minute, second; u
 // answered this command) / failed (no answer after the retries).
 enum CommandState : uint8_t { CMD_IDLE, CMD_SENDING, CMD_DONE, CMD_FAILED };
 enum CommandKind : uint8_t { CMD_NONE, CMD_GAS_CLOSE, CMD_HEAT_POWER, CMD_HEAT_SET, CMD_LIGHT, CMD_OUTLET, CMD_VENT };
-struct CommandStatus { CommandState state; CommandKind kind; uint8_t target; uint8_t attempts; uint32_t at; };
+// value: what was asked (on/off, set temperature, vent code). Vent commands use target 0.
+struct CommandStatus { CommandState state; CommandKind kind; uint8_t target; uint8_t attempts; uint32_t at; uint8_t value; };
+// Commands waiting for the sender: at most one per device (kind, target), the newest value.
+constexpr int COMMAND_QUEUE = 8;
+struct QueuedCommand { CommandKind kind; uint8_t target, value; };
 
 struct WallpadSnapshot {
   WallpadLinkState state;
@@ -88,6 +92,8 @@ struct WallpadSnapshot {
   IntercomState intercom;
   EntranceState entrance;
   CommandStatus command;     // the last device command
+  QueuedCommand queue[COMMAND_QUEUE];  // waiting to be sent, oldest first
+  uint8_t queued;
   uint32_t elevatorCalls;    // elevator call confirmed by the wallpad (AD 2F / CC 10)
   uint32_t elevatorArrivals; // elevator arrived (CC 12)
   WallClock clock;
@@ -97,8 +103,12 @@ struct WallpadSnapshot {
 void wallpadBegin(const char* host, uint16_t port, const char* wifiSsid, const char* wifiPassword);
 WallpadSnapshot wallpadSnapshot();
 
-// Device commands. Each returns false when the link is not connected or another
-// command is still running; progress is reported in WallpadSnapshot::command.
+// Device commands. They never wait: a command is sent at once when the sender is free,
+// otherwise queued (one entry per device, newest value wins; asking again for the value
+// being sent drops the queued one). Commands to one device are spaced (1 s) and limited
+// (8 per minute) so rapid on/off taps cannot flood the bus or the device. Returns false
+// only when the link is not connected or the queue is full. Progress: WallpadSnapshot::command
+// and ::queue.
 bool wallpadCloseGas();                                  // AB 78 00 (RS485 cannot open the valve)
 bool wallpadHeatingPower(uint8_t group, bool on);         // AE 7D GR TG 00 00 00
 bool wallpadHeatingSet(uint8_t group, uint8_t celsius);   // AE 7F GR XX 00 00 00 (10..30)
